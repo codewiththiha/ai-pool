@@ -1,0 +1,56 @@
+[package]
+name = "ai-pool"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Fault-tolerant client for OpenAI-compatible APIs with key pooling, rotation, per-key rate quotas, and encrypted key storage."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/codewiththiha/ai-pool"
+keywords = ["ai", "openai", "api-key", "rotation", "rate-limit"]
+categories = ["api-bindings", "asynchronous"]
+
+[features]
+default = []
+# Enables SQLite storage backend
+sqlite = ["dep:sqlx"]
+# Enables OS Keychain integration for the Master Encryption Key
+os-keychain = ["dep:keyring"]
+# Enables SSE streaming support
+stream = ["dep:futures-util", "reqwest/stream"]
+
+[dependencies]
+# --- Core (Always included) ---
+tokio = { version = "1.43", features = ["sync", "time", "macros", "rt-multi-thread"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+async-trait = "0.1"
+tracing = "0.1"
+dashmap = "6.1"
+
+# --- Cryptography (Needed for Envelope Encryption) ---
+aes-gcm = "0.10"
+rand = "0.9"
+zeroize = "1.8"
+hex = "0.4"
+sha2 = "0.10"
+secrecy = { version = "0.10", features = ["serde"] }
+
+# --- Request builder ---
+schemars = "0.8"
+
+# --- Optional Backends ---
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio-rustls"], optional = true }
+keyring = { version = "3.6", optional = true, features = ["apple-native", "windows-native", "linux-native"] }
+futures-util = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.43", features = ["full"] }
+tempfile = "3.15"
+
+[lints]
+workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
