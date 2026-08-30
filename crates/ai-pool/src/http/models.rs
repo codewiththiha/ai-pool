@@ -32,13 +32,116 @@ pub struct Choice {
 }
 
 /// A chat message (request or response).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Message {
     /// `system`, `user`, `assistant`, ...
     pub role: String,
     /// Message text content.
-    #[serde(default)]
+    ///
+    /// Normalized from the provider's wire form: a plain JSON string is used
+    /// as-is, while an array of content parts (Gemini-style
+    /// `[{"type":"text","text":"..."}]`) is collapsed to the concatenated
+    /// text. Non-text parts (image/audio) are skipped.
     pub content: String,
+}
+
+/// A raw content part as some OpenAI-compatible providers emit it inside
+/// `message.content` (an array of `{type, text,...}` objects).
+#[derive(Debug, Clone, Deserialize)]
+struct ContentPart {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for Message {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // An untagged enum lets us accept either a plain string or a part array.
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Content {
+            Text(String),
+            Parts(Vec<ContentPart>),
+        }
+
+        #[derive(Deserialize)]
+        struct Raw {
+            role: String,
+            #[serde(default)]
+            content: Option<Content>,
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let content = match raw.content {
+            None => String::new(),
+            Some(Content::Text(text)) if text.is_empty() => String::new(),
+            Some(Content::Text(text)) => text,
+            Some(Content::Parts(parts)) => parts
+                .into_iter()
+                .filter(|p| p.kind.as_deref().is_none_or(|k| k == "text"))
+                .filter_map(|p| p.text)
+                .collect::<String>(),
+        };
+        Ok(Self {
+            role: raw.role,
+            content,
+        })
+    }
+}
+
+// Serialized `Message`s still need a plain `String` content for outgoing
+// requests, which the derived `Serialize` above already provides (only the
+// `Deserialize` direction is normalized).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserializes_plain_string_content() {
+        let m: Message = serde_json::from_str(r#"{"role":"assistant","content":"hello"}"#).unwrap();
+        assert_eq!(m.role, "assistant");
+        assert_eq!(m.content, "hello");
+    }
+
+    #[test]
+    fn deserializes_parts_array_content() {
+        let m: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":[{"type":"text","text":"Hel"},{"type":"text","text":"lo"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "Hello");
+    }
+
+    #[test]
+    fn skips_non_text_parts() {
+        let m: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":[{"type":"image_url","image_url":{"url":"x"}},{"type":"text","text":"ok"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(m.content, "ok");
+    }
+
+    #[test]
+    fn missing_or_null_content_is_empty() {
+        let m: Message = serde_json::from_str(r#"{"role":"assistant"}"#).unwrap();
+        assert_eq!(m.content, "");
+        let m: Message = serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
+        assert_eq!(m.content, "");
+    }
+
+    #[test]
+    fn serializes_back_to_plain_string() {
+        let m = Message {
+            role: "user".into(),
+            content: "hi".into(),
+        };
+        assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"role":"user","content":"hi"}"#);
+    }
 }
 
 /// Token usage accounting.
