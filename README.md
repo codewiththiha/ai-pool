@@ -88,6 +88,11 @@ The retry policy is fixed and applies to every request:
 | 5xx | Retry the same key with exponential backoff and jitter |
 | Timeout | Fail immediately; the key is not at fault |
 
+`Retry-After` accepts both wire forms defined by RFC 7231 — a number of
+seconds or an absolute `IMF-fixdate` (e.g. `Wed, 21 Oct 2015 07:28:00 GMT`) —
+and any resulting cooldown is clamped to a 1-hour ceiling so an odd value
+never takes a key offline unreasonably long.
+
 When every key is on cooldown, out of quota, or banned, requests fail with
 `AiError::AllKeysExhausted { retry_in_ms }`, where `retry_in_ms` is the
 soonest known recovery time (`None` if recovery time is unknowable, for
@@ -250,6 +255,13 @@ Reasoning controls map to the JSON different providers expect:
 | `ThinkingConfig::Disabled` | `"reasoning_effort": null` |
 
 Provider-specific fields can be added with `.extra(key, value)`.
+
+Responses are tolerated in both wire forms some OpenAI-compatible providers
+emit: `message.content` may be a plain string, as OpenAI sends it, or an array
+of content parts (`[{"type":"text","text":"..."}]`), as Gemini and several
+aggregators send it — the latter is normalized to the joined text, with
+non-text parts (images/audio) skipped. `send_text()` and structured `send()`
+work unchanged either way.
 
 ## Streaming
 
