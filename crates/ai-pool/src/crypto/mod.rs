@@ -8,7 +8,7 @@
 //! [ 12-byte nonce | ciphertext + 16-byte GCM tag ]
 //! ```
 //!
-//! Because GCM is *authenticated*, flipping a single byte of the SQLite blob
+//! Because GCM is *authenticated*, flipping a single byte of the `SQLite` blob
 //! makes decryption fail with [`VaultError::Corrupted`] rather than yielding
 //! garbage — the Vault marks that key `Banned("corrupted")` and moves on.
 

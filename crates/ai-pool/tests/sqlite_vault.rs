@@ -1,4 +1,4 @@
-//! SQLite vault tests (feature = "sqlite"): persistence across restarts,
+//! `SQLite` vault tests (feature = "sqlite"): persistence across restarts,
 //! idempotent seeding, and tamper detection via AES-GCM authentication.
 
 #![cfg(feature = "sqlite")]

@@ -29,7 +29,7 @@ use super::{KeyHealth, KeyRecord, KeyStore};
 use crate::error::VaultError;
 use crate::quota::{KeyLimits, WindowState};
 
-/// Encrypted-at-rest `KeyStore` persisted in a SQLite database.
+/// Encrypted-at-rest `KeyStore` persisted in a `SQLite` database.
 pub struct SqliteStore {
     pool: SqlitePool,
 }

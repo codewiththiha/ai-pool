@@ -26,7 +26,7 @@ pub enum VaultError {
     #[error("encrypted record corrupted or tampered with: {0}")]
     Corrupted(String),
 
-    /// Storage backend failure (SQLite I/O, pool errors, ...).
+    /// Storage backend failure (`SQLite` I/O, pool errors, ...).
     #[error("storage error: {0}")]
     Storage(String),
 
