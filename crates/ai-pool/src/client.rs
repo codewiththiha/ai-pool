@@ -150,7 +150,7 @@ impl AiClientBuilder {
         self
     }
 
-    /// Use the encrypted SQLite store at `path`. Requires feature `sqlite`.
+    /// Use the encrypted `SQLite` store at `path`. Requires feature `sqlite`.
     #[cfg(feature = "sqlite")]
     pub fn sqlite_store(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.store = StoreChoice::Sqlite(path.into());
