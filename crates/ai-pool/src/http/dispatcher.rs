@@ -71,13 +71,40 @@ impl Dispatcher {
         Duration::from_millis(rand::random::<u64>() % 500)
     }
 
-    /// Parses `Retry-After` (seconds or HTTP-date) with a fallback.
+    /// Parses `Retry-After` (delay-seconds or HTTP-date) with a fallback,
+    /// clamped to [`Self::MAX_COOLDOWN`] so a malformed or absurd value can
+    /// never park a key for an unreasonable time.
+    ///
+    /// Handles both wire forms per RFC 7231 §7.1.3: a bare integer number of
+    /// seconds, or the `IMF-fixdate` calendar form
+    /// (`Wed, 21 Oct 2015 07:28:00 GMT`).
+    const MAX_COOLDOWN: Duration = Duration::from_secs(3600);
+
     pub(crate) fn retry_after(resp: &reqwest::Response, fallback: Duration) -> Duration {
-        resp.headers()
+        let header = resp
+            .headers()
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.trim().parse::<u64>().ok())
-            .map_or(fallback, Duration::from_secs)
+            .map_or("", str::trim);
+        // RFC 7231: either an integer number of seconds, or an absolute
+        // IMF-fixdate (`Wed, 21 Oct 2015 07:28:00 GMT`) in the future.
+        let parsed = header
+            .parse::<u64>()
+            .ok()
+            .map(Duration::from_secs)
+            .or_else(|| {
+                let now = i64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                )
+                .unwrap_or(i64::MIN);
+                parse_http_date(header).and_then(|at| {
+                    (at - now).try_into().ok().map(Duration::from_secs)
+                })
+            });
+        parsed.map_or(fallback, |d| d.min(Self::MAX_COOLDOWN))
     }
 
     /// Marks a key cooling in RAM and (best-effort) on disk.
@@ -270,5 +297,72 @@ pub(crate) fn truncate(s: &str, max: usize) -> String {
             end -= 1;
         }
         format!("{}…", &s[..end])
+    }
+}
+
+/// Parses the RFC 7231 `IMF-fixdate` form of an `HTTP-date`
+/// (`Wed, 21 Oct 2015 07:28:00 GMT`) into unix seconds.
+///
+/// Deliberately dependency-free and case-insensitive on the day/month names,
+/// tolerating the leading weekday token (which RFC 7231 says recipients must
+/// ignore). Returns `None` on any malformed input.
+fn parse_http_date(value: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ];
+    // "Wed, 21 Oct 2015 07:28:00 GMT"  →  [weekday,] day month year hh:mm:ss
+    // Collect non-empty tokens (comma/space separated), then drop the optional
+    // leading weekday name and parse day month year hh:mm:ss.
+    let mut tokens = value
+        .split(|c: char| c.is_whitespace() || c == ',')
+        .filter(|t| !t.is_empty());
+    // Skip a leading alphabetic weekday token if present ("Wed," / "Wednesday").
+    if tokens.clone().next().is_some_and(|t| t.chars().all(|c| c.is_ascii_alphabetic())) {
+        tokens.next();
+    }
+    let day: i64 = tokens.next()?.parse().ok()?;
+    let month_str = tokens.next()?.to_ascii_lowercase();
+    let month_n: i64 = i64::try_from(MONTHS.iter().position(|&m| m == month_str)?).ok()?;
+    let year: i64 = tokens.next()?.parse().ok()?;
+    let time = tokens.next()?;
+    let mut hm = time.split(':');
+    let hour: i64 = hm.next()?.parse().ok()?;
+    let minute: i64 = hm.next()?.parse().ok()?;
+    let second: i64 = hm.next()?.parse().ok()?;
+
+    // Basic gregorian day-of-month validation.
+    if day == 0 || day > 31 || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    // Howard Hinnant's `days_from_civil` (proleptic Gregorian), with a
+    // 1-based month (Jan = 1, ... Dec = 12).
+    let m = month_n + 1;
+    let y = if m <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_imf_fixdate() {
+        // "Wed, 21 Oct 2015 07:28:00 GMT" == 1445412480 unix.
+        let ts = parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT").unwrap();
+        assert_eq!(ts, 1_445_412_480_i64);
+        // Leading weekday is ignored; case-insensitive.
+        assert_eq!(parse_http_date("wednesday, 21 oct 2015 07:28:00 gmt"), Some(ts));
+    }
+
+    #[test]
+    fn rejects_malformed_dates() {
+        assert!(parse_http_date("garbage").is_none());
+        assert!(parse_http_date("32 Jan 2015 00:00:00 GMT").is_none());
+        assert!(parse_http_date("1 Jan 2015 25:00:00 GMT").is_none());
     }
 }
