@@ -12,6 +12,7 @@ use crate::error::AiError;
 use crate::http::dispatcher::Dispatcher;
 use crate::http::models::{ChatResponse, ModelInfo};
 use crate::quota::KeyLimits;
+use crate::sdk::ModeMemory;
 use crate::storage::{KeyManager, KeyStore, Vault, memory::MemoryStore};
 
 #[cfg(feature = "stream")]
@@ -30,6 +31,7 @@ enum StoreChoice {
 pub struct AiClient {
     dispatcher: Arc<Dispatcher>,
     manager: KeyManager,
+    modes: Arc<ModeMemory>,
 }
 
 impl std::fmt::Debug for AiClient {
@@ -65,6 +67,16 @@ impl AiClient {
         &self.manager
     }
 
+    /// The API's base URL, as configured.
+    pub fn base_url(&self) -> &str {
+        &self.dispatcher.config.default_url
+    }
+
+    /// Which JSON mode works per model, for [`crate::Structured`].
+    pub const fn json_modes(&self) -> &Arc<ModeMemory> {
+        &self.modes
+    }
+
     /// A typed request builder instead of raw JSON.
     pub fn chat_builder(&self) -> crate::sdk::ChatBuilder<'_> {
         crate::sdk::ChatBuilder::new(self)
@@ -80,6 +92,7 @@ pub struct AiClientBuilder {
     scope: String,
     master: MasterKeyProvider,
     seed_keys: Vec<(String, Option<KeyLimits>)>,
+    modes: Option<Arc<ModeMemory>>,
 }
 
 impl Default for AiClientBuilder {
@@ -90,11 +103,18 @@ impl Default for AiClientBuilder {
             scope: String::new(),
             master: MasterKeyProvider::Ephemeral,
             seed_keys: Vec::new(),
+            modes: None,
         }
     }
 }
 
 impl AiClientBuilder {
+    /// Shares `memory` of working JSON modes; else each client has its own.
+    pub fn json_modes(mut self, memory: Arc<ModeMemory>) -> Self {
+        self.modes = Some(memory);
+        self
+    }
+
     /// Base URL of the OpenAI-compatible API.
     pub fn default_url(mut self, url: impl Into<String>) -> Self {
         self.config.default_url = url.into();
@@ -287,6 +307,7 @@ impl AiClientBuilder {
         Ok(AiClient {
             dispatcher,
             manager,
+            modes: self.modes.unwrap_or_default(),
         })
     }
 }

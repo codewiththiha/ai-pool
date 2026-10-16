@@ -20,6 +20,8 @@ dialect reaches.
   per provider; the master key lives in the OS keychain, a file, or memory.
 - **Structured output** from any JSON Schema, strict-mode normalised; a
   derive path is optional.
+- **Adaptive JSON** for models that refuse or ignore schemas: JSON mode,
+  then a strict chat prompt, remembering what works per model.
 - **Keyless mode** for Ollama, LM Studio and other local servers.
 - **Streaming** that survives characters split across network frames and
   errors injected mid-stream.
@@ -214,6 +216,50 @@ let result: Sentiment = client
   the token limit as `AiError::Truncated`.
 - With `derive`, `.response_format_schema::<T>("name")` builds the schema
   from `#[derive(JsonSchema)]`, field doc comments becoming descriptions.
+
+### Any model, adaptively
+
+Servers differ in what they honour. Some refuse `json_schema` with a 400,
+some accept it and ignore it (Ollama's cloud models), and some only chat.
+`.structured(name, schema)` asks in the strictest way the model honours.
+It steps down when a mode is refused, or when the answer misses the
+schema:
+
+| Mode | Request |
+|---|---|
+| `JsonMode::Schema` | `json_schema` format, the schema also in the system text |
+| `JsonMode::Object` | `json_object` format, the schema in the system text |
+| `JsonMode::Prompted` | no format; one user message holding the instructions, the request and strict answer rules: one JSON object, no markdown or commentary, these keys, this schema, this example shape |
+
+```rust,ignore
+let answer = client
+    .chat_builder()
+    .model("gemma3")
+    .system("Explain the word in its context.")
+    .user("Word: \"quick\"")
+    .structured("word_info", schema)
+    .send()
+    .await?;
+println!("{} via {:?}", answer.value, answer.mode);
+```
+
+- **It sticks.** The mode that worked is remembered per base URL and
+  model, so the next request starts there; another model on the same
+  server starts again from `Schema`. `ModeMemory::open(path)` keeps the
+  memory in a JSON file across runs, `.json_modes(memory)` shares it
+  between clients, and `forget(url, model)` starts a model over.
+- **Answers are read leniently.** Fences, prose around the object and a
+  leading `<think>` block are skipped. Checking covers types, required
+  keys and enums; extra keys and lengths are allowed.
+- **Even the last mode answers.** If the answer still misses the schema,
+  `send` returns it with `mismatch` saying what is off. Text with no JSON
+  at all is `AiError::InvalidResponse`. Any other failure (a bad key, a
+  missing model, a timeout) is returned at once, without stepping down.
+- **Streaming.** With `stream`, `.send_stream()` yields
+  `StructuredEvent::Partial` values as the object fills in, `Retry(mode)`
+  when it steps down (partials start over), then `Done(answer)`.
+- `ai_pool::json` has the pieces: `extract`, `partial` (closes an
+  unfinished object), `check` and `skeleton`.
 
 Reasoning controls map to the JSON providers expect:
 

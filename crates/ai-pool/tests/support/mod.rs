@@ -57,6 +57,8 @@ pub struct Seen {
     pub line: String,
     /// Every header line, lower-cased names.
     pub headers: Vec<(String, String)>,
+    /// The request body, parsed if it is JSON.
+    pub body: serde_json::Value,
 }
 
 pub struct MockServer {
@@ -137,10 +139,15 @@ impl MockServer {
                             Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
                         })
                         .collect();
+                    let start = (headers_end + 4).min(buf.len());
+                    let end = (start + content_length).min(buf.len());
+                    let body =
+                        serde_json::from_slice(&buf[start..end]).unwrap_or(serde_json::Value::Null);
                     seen.lock().unwrap().push(Seen {
                         bearer,
                         line,
                         headers,
+                        body,
                     });
 
                     let resp = {

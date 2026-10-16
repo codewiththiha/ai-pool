@@ -17,7 +17,12 @@ pub use engine::KeySeed;
 pub use error::{AiError, VaultError};
 pub use http::models::{ChatResponse, Choice, Message, ModelInfo, Usage};
 pub use quota::{KeyLimits, KeyQuotaInfo, WindowInfo, WindowState};
-pub use sdk::{ChatBuilder, ReasoningEffort, ResponseFormat, ThinkingConfig, Unstructured};
+#[cfg(feature = "stream")]
+pub use sdk::StructuredStream;
+pub use sdk::{
+    ChatBuilder, JsonMode, ModeMemory, ReasoningEffort, ResponseFormat, Structured,
+    StructuredAnswer, StructuredEvent, ThinkingConfig, Unstructured, json,
+};
 pub use storage::{
     KeyHealth, KeyManager, KeyMetadata, KeyRecord, KeyStatus, KeyStore, LOST_MASTER_KEY,
 };

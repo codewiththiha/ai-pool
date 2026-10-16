@@ -11,7 +11,7 @@ One crate, `crates/ai-pool`, in three layers that only talk downward:
 | Path | Layer |
 |---|---|
 | `src/client.rs` | `AiClient` and its builder: wiring only |
-| `src/sdk/` | `ChatBuilder`, response formats, strict-schema rewriting |
+| `src/sdk/` | `ChatBuilder`, response formats, strict-schema rewriting, adaptive JSON modes |
 | `src/http/` | `Dispatcher` (retry table), wire models, SSE parsing |
 | `src/engine/` | Key selection: rotation, health, quota gates |
 | `src/quota.rs` | Minute and hour windows, concurrency caps |

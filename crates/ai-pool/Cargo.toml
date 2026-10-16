@@ -1,6 +1,6 @@
 [package]
 name = "ai-pool"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Fault-tolerant client for OpenAI-compatible APIs with key pooling, rotation, per-key rate quotas, and encrypted key storage."

@@ -93,15 +93,15 @@ impl ResponseFormat {
 #[must_use = "call one of the send methods to execute the request"]
 #[derive(Clone)]
 pub struct ChatBuilder<'a, T = Unstructured> {
-    client: &'a AiClient,
-    model: Option<String>,
-    messages: Vec<Message>,
+    pub(super) client: &'a AiClient,
+    pub(super) model: Option<String>,
+    pub(super) messages: Vec<Message>,
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u32>,
     max_completion_tokens: Option<u32>,
     thinking: Option<ThinkingConfig>,
-    response_format: Option<ResponseFormat>,
+    pub(super) response_format: Option<ResponseFormat>,
     extra: Map<String, Value>,
     _output: PhantomData<fn() -> T>,
 }
@@ -326,7 +326,7 @@ fn format_json(format: &ResponseFormat) -> Value {
 }
 
 /// The first choice, or why there is no usable one.
-fn first_choice(resp: ChatResponse) -> Result<Choice, AiError> {
+pub(super) fn first_choice(resp: ChatResponse) -> Result<Choice, AiError> {
     let choice = resp
         .choices
         .into_iter()
@@ -338,7 +338,7 @@ fn first_choice(resp: ChatResponse) -> Result<Choice, AiError> {
     Ok(choice)
 }
 
-fn cut_off(choice: &Choice) -> bool {
+pub(super) fn cut_off(choice: &Choice) -> bool {
     choice.finish_reason.as_deref() == Some("length")
 }
 
