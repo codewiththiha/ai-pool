@@ -1,5 +1,4 @@
-//! In-memory `KeyStore` backed by a `DashMap`. Perfect for testing or
-//! ephemeral sessions: blobs live in RAM and are lost on app exit.
+//! A RAM [`KeyStore`](super::KeyStore), for tests and short sessions.
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -31,9 +30,7 @@ impl KeyStore for MemoryStore {
     }
 
     async fn insert(&self, record: &KeyRecord) -> Result<(), VaultError> {
-        // Idempotent: an existing id keeps its original row (matching the
-        // SQLite INSERT OR IGNORE semantics) so re-seeding never clobbers
-        // health/quota state.
+        // An existing id keeps its row, like the SQLite store.
         self.records
             .entry(record.id.clone())
             .or_insert_with(|| record.clone());

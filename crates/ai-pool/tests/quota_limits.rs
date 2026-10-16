@@ -1,6 +1,4 @@
-//! Integration tests for per-key quota intelligence: minute/hour windows,
-//! concurrency-aware reactive splitting, realtime introspection endpoints,
-//! and the proactive + concurrency configuration guard.
+//! Per-key quotas: windows, concurrency splitting and persistence.
 
 mod support;
 
@@ -77,7 +75,17 @@ async fn quota_info_endpoint_tracks_realtime() {
 
     // list_keys carries the same quota snapshot.
     let metas = client.manager().list_keys().await.unwrap();
-    assert_eq!(metas[0].quota.as_ref().unwrap().minute.as_ref().unwrap().used, 2);
+    assert_eq!(
+        metas[0]
+            .quota
+            .as_ref()
+            .unwrap()
+            .minute
+            .as_ref()
+            .unwrap()
+            .used,
+        2
+    );
 }
 
 #[tokio::test]
@@ -134,7 +142,10 @@ async fn proactive_plus_concurrency_is_a_build_error() {
         .unwrap();
     let err = client
         .manager()
-        .add_key_with_limits("sk-other-key-02", Some(KeyLimits::none().max_concurrency(2)))
+        .add_key_with_limits(
+            "sk-other-key-02",
+            Some(KeyLimits::none().max_concurrency(2)),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, AiError::InvalidConfig(_)));
@@ -157,18 +168,21 @@ async fn rate_limits_work_fine_with_proactive() {
         client.chat(payload()).await.unwrap();
     }
     let err = client.chat(payload()).await.unwrap_err();
-    assert!(matches!(err, AiError::AllKeysExhausted { retry_in_ms: Some(_) }));
+    assert!(matches!(
+        err,
+        AiError::AllKeysExhausted {
+            retry_in_ms: Some(_)
+        }
+    ));
     assert_eq!(server.bearers().len(), 4);
 }
 
 #[tokio::test]
 async fn concurrency_splits_parallel_requests_across_keys() {
     // Slow server so requests overlap; each key allows 2 concurrent.
-    let server = MockServer::start_with_delay(
-        vec![Scripted::ok_chat("ok")],
-        Duration::from_millis(300),
-    )
-    .await;
+    let server =
+        MockServer::start_with_delay(vec![Scripted::ok_chat("ok")], Duration::from_millis(300))
+            .await;
     let client = AiClient::builder()
         .default_url(&server.url)
         .rotation_mode(RotationMode::Reactive)
@@ -178,8 +192,7 @@ async fn concurrency_splits_parallel_requests_across_keys() {
         .await
         .unwrap();
 
-    // Fire 4 requests at once: without splitting they'd all pile on key A
-    // and 2 would fail; with quota intelligence they split 2/2 and all pass.
+    // Four at once: without splitting they would all pile onto key A.
     let mut handles = Vec::new();
     for _ in 0..4 {
         let c = client.clone();
@@ -197,11 +210,9 @@ async fn concurrency_splits_parallel_requests_across_keys() {
 
 #[tokio::test]
 async fn saturation_beyond_total_capacity_errors_not_hangs() {
-    let server = MockServer::start_with_delay(
-        vec![Scripted::ok_chat("ok")],
-        Duration::from_millis(400),
-    )
-    .await;
+    let server =
+        MockServer::start_with_delay(vec![Scripted::ok_chat("ok")], Duration::from_millis(400))
+            .await;
     let client = AiClient::builder()
         .default_url(&server.url)
         .rotation_mode(RotationMode::Reactive)
@@ -243,7 +254,12 @@ async fn set_key_limits_updates_live() {
 
     client.chat(payload()).await.unwrap();
     let err = client.chat(payload()).await.unwrap_err();
-    assert!(matches!(err, AiError::AllKeysExhausted { retry_in_ms: Some(_) }));
+    assert!(matches!(
+        err,
+        AiError::AllKeysExhausted {
+            retry_in_ms: Some(_)
+        }
+    ));
 
     // Lifting the limit restores service.
     client.manager().set_key_limits(&id, None).await.unwrap();

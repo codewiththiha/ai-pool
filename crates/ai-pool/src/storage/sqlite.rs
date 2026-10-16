@@ -1,108 +1,122 @@
-//! SQLx-backed `KeyStore` (feature = "sqlite").
-//!
-//! Schema (v2 — quota columns added via lightweight migration):
-//! ```sql
-//! CREATE TABLE ai_pool_keys (
-//!     id                TEXT PRIMARY KEY,
-//!     ciphertext        BLOB NOT NULL,   -- nonce || AES-256-GCM ct+tag
-//!     censored          TEXT NOT NULL,
-//!     status            TEXT NOT NULL,   -- active | cooldown | banned
-//!     ban_reason        TEXT,
-//!     cooldown_until_ms INTEGER,
-//!     limits_json       TEXT,            -- serialized KeyLimits, NULL = pool default
-//!     minute_start_ms   INTEGER,         -- minute window start (unix ms)
-//!     minute_used       INTEGER,
-//!     hour_start_ms     INTEGER,         -- hour window start (unix ms)
-//!     hour_used         INTEGER,
-//!     created_at_ms     INTEGER NOT NULL
-//! );
-//! ```
+//! A [`KeyStore`] in one `SQLite` file, one scope per client, run on
+//! tokio's blocking pool.
 
 use std::path::Path;
-use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::{KeyHealth, KeyRecord, KeyStore};
 use crate::error::VaultError;
 use crate::quota::{KeyLimits, WindowState};
 
-/// Encrypted-at-rest `KeyStore` persisted in a `SQLite` database.
+const TABLE: &str = "ai_pool_keys_v3";
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS ai_pool_keys_v3 (
+    scope             TEXT NOT NULL,
+    id                TEXT NOT NULL,
+    ciphertext        BLOB NOT NULL,
+    censored          TEXT NOT NULL,
+    status            TEXT NOT NULL,
+    ban_reason        TEXT,
+    cooldown_until_ms INTEGER,
+    limits_json       TEXT,
+    minute_start_ms   INTEGER,
+    minute_used       INTEGER,
+    hour_start_ms     INTEGER,
+    hour_used         INTEGER,
+    created_at_ms     INTEGER NOT NULL,
+    PRIMARY KEY (scope, id)
+);";
+
+const COLUMNS: &str = "id, ciphertext, censored, status, ban_reason, cooldown_until_ms, \
+     limits_json, minute_start_ms, minute_used, hour_start_ms, hour_used, created_at_ms";
+
+/// Encrypted key rows of one scope inside a SQLite file.
+#[derive(Clone)]
 pub struct SqliteStore {
-    pool: SqlitePool,
+    conn: Arc<Mutex<Connection>>,
+    scope: Arc<str>,
 }
 
-fn db_err(e: &sqlx::Error) -> VaultError {
+impl std::fmt::Debug for SqliteStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteStore")
+            .field("scope", &self.scope)
+            .finish_non_exhaustive()
+    }
+}
+
+fn db_err(e: &rusqlite::Error) -> VaultError {
     VaultError::Storage(e.to_string())
 }
 
 impl SqliteStore {
-    /// Opens (creating if needed) the database at `path` and runs migrations.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self, VaultError> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| VaultError::Storage(e.to_string()))?;
-            }
-        }
-        let url = format!("sqlite://{}", path.display());
-        let opts = SqliteConnectOptions::from_str(&url)
-            .map_err(|e| db_err(&e))?
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal);
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect_with(opts)
+    /// Opens or creates the file at `path` and uses rows of `scope`.
+    pub async fn open(path: impl AsRef<Path>, scope: &str) -> Result<Self, VaultError> {
+        let path = path.as_ref().to_path_buf();
+        let conn = tokio::task::spawn_blocking(move || Self::connect(&path))
             .await
-            .map_err(|e| db_err(&e))?;
+            .map_err(|e| VaultError::Storage(e.to_string()))??;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            scope: Arc::from(scope),
+        })
+    }
 
-        sqlx::query(
-            r"
-            CREATE TABLE IF NOT EXISTS ai_pool_keys (
-                id                TEXT PRIMARY KEY,
-                ciphertext        BLOB NOT NULL,
-                censored          TEXT NOT NULL,
-                status            TEXT NOT NULL,
-                ban_reason        TEXT,
-                cooldown_until_ms INTEGER,
-                limits_json       TEXT,
-                minute_start_ms   INTEGER,
-                minute_used       INTEGER,
-                hour_start_ms     INTEGER,
-                hour_used         INTEGER,
-                created_at_ms     INTEGER NOT NULL
-            )
-            ",
-        )
-        .execute(&pool)
-        .await
-        .map_err(|e| db_err(&e))?;
-
-        // Lightweight migration for databases created before quota support;
-        // "duplicate column name" is the expected no-op on current schemas.
-        for col in [
-            "limits_json TEXT",
-            "minute_start_ms INTEGER",
-            "minute_used INTEGER",
-            "hour_start_ms INTEGER",
-            "hour_used INTEGER",
-        ] {
-            let _ = sqlx::query(&format!("ALTER TABLE ai_pool_keys ADD COLUMN {col}"))
-                .execute(&pool)
-                .await;
+    fn connect(path: &Path) -> Result<Connection, VaultError> {
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent).map_err(|e| VaultError::Storage(e.to_string()))?;
         }
-
-        Ok(Self { pool })
+        let conn = Connection::open(path).map_err(|e| db_err(&e))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| db_err(&e))?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(|e| db_err(&e))?;
+        conn.execute_batch(SCHEMA).map_err(|e| db_err(&e))?;
+        migrate_v2(&conn)?;
+        Ok(conn)
     }
 
-    /// Escape hatch: direct access to the underlying pool.
-    pub const fn pool(&self) -> &SqlitePool {
-        &self.pool
+    /// Runs `job` with the connection on the blocking pool.
+    async fn with<T, F>(&self, job: F) -> Result<T, VaultError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection, &str) -> Result<T, VaultError> + Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        let scope = Arc::clone(&self.scope);
+        tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| VaultError::Storage("connection lock poisoned".into()))?;
+            job(&guard, &scope)
+        })
+        .await
+        .map_err(|e| VaultError::Storage(e.to_string()))?
     }
+}
+
+/// Copies rows of the unscoped 0.2 table into the empty scope once.
+fn migrate_v2(conn: &Connection) -> Result<(), VaultError> {
+    let old: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_pool_keys')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| db_err(&e))?;
+    if old {
+        conn.execute_batch(&format!(
+            "INSERT OR IGNORE INTO {TABLE} (scope, {COLUMNS}) SELECT '', {COLUMNS} FROM ai_pool_keys;
+             ALTER TABLE ai_pool_keys RENAME TO ai_pool_keys_v2_migrated;"
+        ))
+        .map_err(|e| db_err(&e))?;
+    }
+    Ok(())
 }
 
 fn window_columns(w: Option<WindowState>) -> (Option<i64>, Option<i64>) {
@@ -114,72 +128,124 @@ fn window_columns(w: Option<WindowState>) -> (Option<i64>, Option<i64>) {
 fn window_from_columns(start: Option<i64>, used: Option<i64>) -> Option<WindowState> {
     Some(WindowState {
         start_ms: start?,
-        used: u32::try_from(used?).unwrap_or(u32::MAX),
+        used: u32::try_from(used?.max(0)).unwrap_or(u32::MAX),
     })
 }
 
-fn row_to_record(row: &sqlx::sqlite::SqliteRow) -> KeyRecord {
-    let status: String = row.get("status");
-    let reason: Option<String> = row.get("ban_reason");
-    let cooldown: Option<i64> = row.get("cooldown_until_ms");
-    let limits_json: Option<String> = row.get("limits_json");
-    KeyRecord {
-        id: row.get("id"),
-        ciphertext: row.get("ciphertext"),
-        censored: row.get("censored"),
-        health: KeyHealth::from_columns(&status, reason, cooldown),
-        limits: limits_json.and_then(|j| serde_json::from_str(&j).ok()),
-        minute_window: window_from_columns(row.get("minute_start_ms"), row.get("minute_used")),
-        hour_window: window_from_columns(row.get("hour_start_ms"), row.get("hour_used")),
-        created_at_ms: row.get("created_at_ms"),
+fn limits_json(limits: Option<&KeyLimits>) -> Option<String> {
+    limits.and_then(|l| serde_json::to_string(l).ok())
+}
+
+/// Any column type as bytes; a mistyped blob then fails to open.
+fn bytes_of(value: ValueRef<'_>) -> Vec<u8> {
+    match value {
+        ValueRef::Blob(b) | ValueRef::Text(b) => b.to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+fn row_to_record(row: &Row<'_>) -> rusqlite::Result<KeyRecord> {
+    let status: String = row.get("status")?;
+    let limits: Option<String> = row.get("limits_json")?;
+    Ok(KeyRecord {
+        id: row.get("id")?,
+        ciphertext: bytes_of(row.get_ref("ciphertext")?),
+        censored: row.get("censored")?,
+        health: KeyHealth::from_columns(
+            &status,
+            row.get("ban_reason")?,
+            row.get("cooldown_until_ms")?,
+        ),
+        limits: limits.and_then(|j| serde_json::from_str(&j).ok()),
+        minute_window: window_from_columns(row.get("minute_start_ms")?, row.get("minute_used")?),
+        hour_window: window_from_columns(row.get("hour_start_ms")?, row.get("hour_used")?),
+        created_at_ms: row.get("created_at_ms")?,
+    })
+}
+
+fn require_row(changed: usize, id: &str) -> Result<(), VaultError> {
+    if changed == 0 {
+        Err(VaultError::NotFound(id.to_string()))
+    } else {
+        Ok(())
     }
 }
 
 #[async_trait]
 impl KeyStore for SqliteStore {
     async fn load_all(&self) -> Result<Vec<KeyRecord>, VaultError> {
-        let rows = sqlx::query("SELECT * FROM ai_pool_keys ORDER BY created_at_ms, id")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| db_err(&e))?;
-        Ok(rows.iter().map(row_to_record).collect())
+        self.with(|conn, scope| {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM {TABLE} WHERE scope = ?1 ORDER BY created_at_ms, id"
+            );
+            let mut stmt = conn.prepare(&sql).map_err(|e| db_err(&e))?;
+            let rows = stmt
+                .query_map([scope], row_to_record)
+                .map_err(|e| db_err(&e))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(|e| db_err(&e))
+        })
+        .await
     }
 
     async fn insert(&self, record: &KeyRecord) -> Result<(), VaultError> {
-        let (status, reason, cooldown) = record.health.to_columns();
-        let limits_json = record
-            .limits
-            .as_ref()
-            .and_then(|l| serde_json::to_string(l).ok());
-        let (m_start, m_used) = window_columns(record.minute_window);
-        let (h_start, h_used) = window_columns(record.hour_window);
-        // Idempotent seeding: INSERT OR IGNORE keeps the original row when the
-        // deterministic id already exists (builder re-run after restart).
-        sqlx::query(
-            r"
-            INSERT OR IGNORE INTO ai_pool_keys
-              (id, ciphertext, censored, status, ban_reason, cooldown_until_ms,
-               limits_json, minute_start_ms, minute_used, hour_start_ms, hour_used,
-               created_at_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ",
-        )
-        .bind(&record.id)
-        .bind(&record.ciphertext)
-        .bind(&record.censored)
-        .bind(status)
-        .bind(reason)
-        .bind(cooldown)
-        .bind(limits_json)
-        .bind(m_start)
-        .bind(m_used)
-        .bind(h_start)
-        .bind(h_used)
-        .bind(record.created_at_ms)
-        .execute(&self.pool)
+        let record = record.clone();
+        self.with(move |conn, scope| {
+            let (status, reason, cooldown) = record.health.to_columns();
+            let (m_start, m_used) = window_columns(record.minute_window);
+            let (h_start, h_used) = window_columns(record.hour_window);
+            let sql = format!(
+                "INSERT OR IGNORE INTO {TABLE} (scope, {COLUMNS})
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+            );
+            conn.execute(
+                &sql,
+                params![
+                    scope,
+                    record.id,
+                    record.ciphertext,
+                    record.censored,
+                    status,
+                    reason,
+                    cooldown,
+                    limits_json(record.limits.as_ref()),
+                    m_start,
+                    m_used,
+                    h_start,
+                    h_used,
+                    record.created_at_ms,
+                ],
+            )
+            .map_err(|e| db_err(&e))?;
+            Ok(())
+        })
         .await
-        .map_err(|e| db_err(&e))?;
-        Ok(())
+    }
+
+    async fn delete(&self, id: &str) -> Result<(), VaultError> {
+        let id = id.to_string();
+        self.with(move |conn, scope| {
+            let sql = format!("DELETE FROM {TABLE} WHERE scope = ?1 AND id = ?2");
+            let changed = conn.execute(&sql, [scope, &id]).map_err(|e| db_err(&e))?;
+            require_row(changed, &id)
+        })
+        .await
+    }
+
+    async fn update_health(&self, id: &str, health: KeyHealth) -> Result<(), VaultError> {
+        let id = id.to_string();
+        self.with(move |conn, scope| {
+            let (status, reason, cooldown) = health.to_columns();
+            let sql = format!(
+                "UPDATE {TABLE} SET status = ?1, ban_reason = ?2, cooldown_until_ms = ?3
+                 WHERE scope = ?4 AND id = ?5"
+            );
+            let changed = conn
+                .execute(&sql, params![status, reason, cooldown, scope, id])
+                .map_err(|e| db_err(&e))?;
+            require_row(changed, &id)
+        })
+        .await
     }
 
     async fn update_quota(
@@ -189,69 +255,42 @@ impl KeyStore for SqliteStore {
         minute: Option<WindowState>,
         hour: Option<WindowState>,
     ) -> Result<(), VaultError> {
-        let limits_json = limits.as_ref().and_then(|l| serde_json::to_string(l).ok());
-        let (m_start, m_used) = window_columns(minute);
-        let (h_start, h_used) = window_columns(hour);
-        let res = sqlx::query(
-            r"
-            UPDATE ai_pool_keys
-            SET limits_json = ?, minute_start_ms = ?, minute_used = ?,
-                hour_start_ms = ?, hour_used = ?
-            WHERE id = ?
-            ",
-        )
-        .bind(limits_json)
-        .bind(m_start)
-        .bind(m_used)
-        .bind(h_start)
-        .bind(h_used)
-        .bind(id)
-        .execute(&self.pool)
+        let id = id.to_string();
+        self.with(move |conn, scope| {
+            let (m_start, m_used) = window_columns(minute);
+            let (h_start, h_used) = window_columns(hour);
+            let sql = format!(
+                "UPDATE {TABLE} SET limits_json = ?1, minute_start_ms = ?2, minute_used = ?3,
+                 hour_start_ms = ?4, hour_used = ?5 WHERE scope = ?6 AND id = ?7"
+            );
+            let changed = conn
+                .execute(
+                    &sql,
+                    params![
+                        limits_json(limits.as_ref()),
+                        m_start,
+                        m_used,
+                        h_start,
+                        h_used,
+                        scope,
+                        id
+                    ],
+                )
+                .map_err(|e| db_err(&e))?;
+            require_row(changed, &id)
+        })
         .await
-        .map_err(|e| db_err(&e))?;
-        if res.rows_affected() == 0 {
-            return Err(VaultError::NotFound(id.to_string()));
-        }
-        Ok(())
-    }
-
-    async fn delete(&self, id: &str) -> Result<(), VaultError> {
-        let res = sqlx::query("DELETE FROM ai_pool_keys WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| db_err(&e))?;
-        if res.rows_affected() == 0 {
-            return Err(VaultError::NotFound(id.to_string()));
-        }
-        Ok(())
-    }
-
-    async fn update_health(&self, id: &str, health: KeyHealth) -> Result<(), VaultError> {
-        let (status, reason, cooldown) = health.to_columns();
-        let res = sqlx::query(
-            "UPDATE ai_pool_keys SET status = ?, ban_reason = ?, cooldown_until_ms = ? WHERE id = ?",
-        )
-        .bind(status)
-        .bind(reason)
-        .bind(cooldown)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| db_err(&e))?;
-        if res.rows_affected() == 0 {
-            return Err(VaultError::NotFound(id.to_string()));
-        }
-        Ok(())
     }
 
     async fn get(&self, id: &str) -> Result<KeyRecord, VaultError> {
-        let row = sqlx::query("SELECT * FROM ai_pool_keys WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| db_err(&e))?;
-        row.map(|r| row_to_record(&r))
-            .ok_or_else(|| VaultError::NotFound(id.to_string()))
+        let id = id.to_string();
+        self.with(move |conn, scope| {
+            let sql = format!("SELECT {COLUMNS} FROM {TABLE} WHERE scope = ?1 AND id = ?2");
+            conn.query_row(&sql, [scope, &id], row_to_record)
+                .optional()
+                .map_err(|e| db_err(&e))?
+                .ok_or(VaultError::NotFound(id))
+        })
+        .await
     }
 }

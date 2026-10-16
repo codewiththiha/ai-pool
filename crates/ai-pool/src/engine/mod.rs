@@ -1,8 +1,4 @@
-//! Key selection and rotation.
-//!
-//! Holds the decrypted keys in RAM (`DashMap<String, KeyState>`) and decides
-//! *which* key to use for the next request, honoring each key's optional
-//! quota limits (per-minute / per-hour windows, per-key concurrency).
+//! Key selection: rotation, health and quota gates over decrypted keys.
 
 pub mod proactive;
 pub mod reactive;
@@ -69,11 +65,7 @@ impl KeySeed {
 
     /// Sets persisted windows.
     #[must_use]
-    pub const fn windows(
-        mut self,
-        minute: Option<WindowState>,
-        hour: Option<WindowState>,
-    ) -> Self {
+    pub const fn windows(mut self, minute: Option<WindowState>, hour: Option<WindowState>) -> Self {
         self.minute = minute;
         self.hour = hour;
         self
@@ -111,11 +103,7 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// A key leased to the Dispatcher for one attempt.
-///
-/// Holding the lease counts as one in-flight request against the key's
-/// concurrency quota; dropping it releases the slot. Keep it alive for the
-/// full duration of the HTTP call (including streaming).
+/// A key leased for one attempt; dropping it frees its concurrency slot.
 pub struct LeasedKey {
     /// Id of the leased key.
     pub id: String,
@@ -136,8 +124,6 @@ pub struct KeyPool {
     primary: RwLock<Option<String>>,
     /// Monotonic insertion counter.
     next_order: AtomicUsize,
-    #[cfg(feature = "sqlite")]
-    sqlite_pool: RwLock<Option<sqlx::SqlitePool>>,
 }
 
 impl KeyPool {
@@ -150,8 +136,6 @@ impl KeyPool {
             cursor: AtomicUsize::new(0),
             primary: RwLock::new(None),
             next_order: AtomicUsize::new(0),
-            #[cfg(feature = "sqlite")]
-            sqlite_pool: RwLock::new(None),
         }
     }
 
@@ -165,20 +149,7 @@ impl KeyPool {
         self.default_limits
     }
 
-    #[cfg(feature = "sqlite")]
-    pub(crate) fn register_sqlite_pool(&self, pool: sqlx::SqlitePool) {
-        *self.sqlite_pool.write().expect("lock poisoned") = Some(pool);
-    }
-
-    #[cfg(feature = "sqlite")]
-    pub(crate) fn raw_sqlite_pool(&self) -> Option<sqlx::SqlitePool> {
-        self.sqlite_pool.read().expect("lock poisoned").clone()
-    }
-
-    /// Insert or replace a key in the live pool.
-    ///
-    /// `limits: None` applies the pool default; persisted windows (from the
-    /// vault) carry hour-quota usage across restarts.
+    /// Inserts or replaces a key in the live pool.
     pub fn upsert(&self, seed: KeySeed) {
         let order = self.keys.get(&seed.id).map_or_else(
             || self.next_order.fetch_add(1, Ordering::Relaxed),
@@ -201,12 +172,12 @@ impl KeyPool {
     }
 
     /// Removes a key from the live pool.
-    ///
-    /// # Panics
-    /// Panics only if the internal primary lock is poisoned.
     pub fn remove(&self, id: &str) {
         self.keys.remove(id);
-        let mut primary = self.primary.write().expect("lock poisoned");
+        let mut primary = self
+            .primary
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if primary.as_deref() == Some(id) {
             *primary = None;
         }
@@ -306,24 +277,18 @@ impl KeyPool {
         let Some(mut k) = self.keys.get_mut(id) else {
             return;
         };
-        if let Some(ms) = k.limits.concurrency_cooldown_ms {
-            if matches!(k.health, KeyHealth::Active) {
-                k.health = KeyHealth::Cooldown {
-                    retry_after: Instant::now() + Duration::from_millis(ms),
-                };
-            }
+        if let Some(ms) = k.limits.concurrency_cooldown_ms
+            && matches!(k.health, KeyHealth::Active)
+        {
+            k.health = KeyHealth::Cooldown {
+                retry_after: Instant::now() + Duration::from_millis(ms),
+            };
         }
     }
 
-    /// Picks the next key according to the configured rotation mode and every
-    /// quota gate, then leases it: rate windows are consumed and the
-    /// in-flight counter incremented (released when the lease drops).
-    ///
-    /// Returns `None` when no key is currently usable — inspect
-    /// [`Self::earliest_recovery_ms`] to distinguish "wait" from "dead".
+    /// The next key by rotation mode, health and quota, already leased.
     pub fn next_key(&self) -> Option<LeasedKey> {
-        // Small retry loop: selection and lease are separate critical
-        // sections, so a concurrent lease can race a concurrency slot away.
+        // Selection and lease are separate locks, so a race retries.
         for _ in 0..4 {
             let now_instant = Instant::now();
             let now = quota::now_ms();
@@ -337,8 +302,7 @@ impl KeyPool {
                 RotationMode::Reactive => {
                     // Concurrency-aware sticky failover: skip saturated keys
                     // instead of waiting for a 429 to force rotation.
-                    let picked =
-                        reactive::pick(&self.primary, &usable, |id| self.is_saturated(id));
+                    let picked = reactive::pick(&self.primary, &usable, |id| self.is_saturated(id));
                     if let Some(id) = picked {
                         id
                     } else {
@@ -359,8 +323,7 @@ impl KeyPool {
         None
     }
 
-    /// Attempts to lease `id` right now: re-validates quota gates under the
-    /// entry lock, consumes windows, and increments in-flight.
+    /// Leases `id` now, rechecking its quota under the entry lock.
     fn try_lease(&self, id: &str, now: i64) -> Option<LeasedKey> {
         let mut k = self.keys.get_mut(id)?;
 
@@ -370,10 +333,10 @@ impl KeyPool {
         {
             return None;
         }
-        if let Some(maxc) = k.limits.max_concurrency {
-            if k.in_flight.load(Ordering::Acquire) >= maxc {
-                return None;
-            }
+        if let Some(maxc) = k.limits.max_concurrency
+            && k.in_flight.load(Ordering::Acquire) >= maxc
+        {
+            return None;
         }
 
         if k.limits.per_minute.is_some() {
@@ -391,12 +354,7 @@ impl KeyPool {
         })
     }
 
-    /// Milliseconds until the soonest key becomes usable again, if that time
-    /// is knowable (health cooldowns and exhausted rate windows; concurrency
-    /// saturation has no deterministic end unless a cooldown was configured).
-    ///
-    /// `None` means either a key is usable right now, or every blocked key is
-    /// blocked indefinitely (banned / saturated without cooldown).
+    /// Milliseconds until the soonest key recovers by itself, if any.
     pub fn earliest_recovery_ms(&self) -> Option<u64> {
         let now_instant = Instant::now();
         let now = quota::now_ms();
@@ -494,9 +452,7 @@ mod tests {
         p.set_health(
             "k0",
             KeyHealth::Cooldown {
-                retry_after: Instant::now()
-                    .checked_sub(Duration::from_secs(1))
-                    .unwrap(),
+                retry_after: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
             },
         );
         assert!(p.next_key().is_some());
@@ -504,11 +460,7 @@ mod tests {
 
     #[test]
     fn minute_limit_blocks_then_reports_wait() {
-        let p = pool_with_limits(
-            RotationMode::Reactive,
-            1,
-            KeyLimits::none().per_minute(3),
-        );
+        let p = pool_with_limits(RotationMode::Reactive, 1, KeyLimits::none().per_minute(3));
         for _ in 0..3 {
             assert!(p.next_key().is_some());
         }
@@ -540,11 +492,7 @@ mod tests {
 
     #[test]
     fn quota_blocked_key_rotates_to_next() {
-        let p = pool_with_limits(
-            RotationMode::Reactive,
-            2,
-            KeyLimits::none().per_minute(1),
-        );
+        let p = pool_with_limits(RotationMode::Reactive, 2, KeyLimits::none().per_minute(1));
         assert_eq!(p.next_key().unwrap().id, "k0");
         // k0 exhausted its minute quota: reactive must fail over to k1.
         assert_eq!(p.next_key().unwrap().id, "k1");
@@ -622,11 +570,7 @@ mod tests {
 
     #[test]
     fn per_key_limits_override_default() {
-        let p = pool_with_limits(
-            RotationMode::Reactive,
-            2,
-            KeyLimits::none().per_minute(1),
-        );
+        let p = pool_with_limits(RotationMode::Reactive, 2, KeyLimits::none().per_minute(1));
         p.set_limits("k1", KeyLimits::none()); // k1 unlimited
         assert_eq!(p.next_key().unwrap().id, "k0");
         for _ in 0..5 {

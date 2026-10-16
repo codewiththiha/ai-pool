@@ -1,8 +1,4 @@
-//! Minimal in-process HTTP/1.1 mock server (no extra deps) for driving the
-//! dispatcher through its semantics table.
-//!
-//! Compiled independently into each test binary, so not every binary uses
-//! every helper.
+//! An in-process HTTP/1.1 mock server replaying scripted responses.
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
@@ -18,6 +14,8 @@ pub struct Scripted {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// Sends the body in two writes, split at this byte.
+    pub split_at: Option<usize>,
 }
 
 impl Scripted {
@@ -26,6 +24,7 @@ impl Scripted {
             status,
             headers: vec![("content-type".into(), "application/json".into())],
             body: body.to_string(),
+            split_at: None,
         }
     }
 
@@ -39,16 +38,25 @@ impl Scripted {
         )
     }
 
+    pub const fn split_at(mut self, at: usize) -> Self {
+        self.split_at = Some(at);
+        self
+    }
+
     pub fn with_header(mut self, k: &str, v: &str) -> Self {
         self.headers.push((k.into(), v.into()));
         self
     }
 }
 
-/// One recorded request: (path, authorization bearer token, body).
+/// One recorded request.
 #[derive(Debug, Clone)]
 pub struct Seen {
     pub bearer: String,
+    /// The request line, e.g. `GET /v1/models HTTP/1.1`.
+    pub line: String,
+    /// Every header line, lower-cased names.
+    pub headers: Vec<(String, String)>,
 }
 
 pub struct MockServer {
@@ -58,18 +66,13 @@ pub struct MockServer {
 }
 
 impl MockServer {
-    /// Starts the server with a queue of scripted responses. When the queue
-    /// runs dry, it keeps replaying the last response.
+    /// Replays `responses` in order, then repeats the last one.
     pub async fn start(responses: Vec<Scripted>) -> Self {
         Self::start_with_delay(responses, std::time::Duration::ZERO).await
     }
 
-    /// Like [`Self::start`], but sleeps `delay` before answering each
-    /// request — lets tests overlap concurrent in-flight requests.
-    pub async fn start_with_delay(
-        responses: Vec<Scripted>,
-        delay: std::time::Duration,
-    ) -> Self {
+    /// Like [`Self::start`], sleeping `delay` before each answer.
+    pub async fn start_with_delay(responses: Vec<Scripted>, delay: std::time::Duration) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let script: Arc<Mutex<VecDeque<Scripted>>> =
@@ -91,7 +94,6 @@ impl MockServer {
                     }
                     let mut buf = Vec::new();
                     let mut tmp = [0u8; 4096];
-                    // Read until end of headers, then honor content-length.
                     let (headers_end, header_str) = loop {
                         let n = sock.read(&mut tmp).await.unwrap_or(0);
                         if n == 0 {
@@ -126,27 +128,32 @@ impl MockServer {
                                 .then(|| v.trim().trim_start_matches("Bearer ").to_string())
                         })
                         .unwrap_or_default();
-                    seen.lock().unwrap().push(Seen { bearer });
+                    let line = header_str.lines().next().unwrap_or_default().to_string();
+                    let headers = header_str
+                        .lines()
+                        .skip(1)
+                        .filter_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            Some((k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                        })
+                        .collect();
+                    seen.lock().unwrap().push(Seen {
+                        bearer,
+                        line,
+                        headers,
+                    });
 
                     let resp = {
                         let mut q = script.lock().unwrap();
                         if q.len() > 1 {
                             q.pop_front().unwrap()
                         } else {
-                            q.front().cloned().unwrap_or_else(|| Scripted::json(500, "{}"))
+                            q.front()
+                                .cloned()
+                                .unwrap_or_else(|| Scripted::json(500, "{}"))
                         }
                     };
-                    let mut out = format!(
-                        "HTTP/1.1 {} MOCK\r\ncontent-length: {}\r\nconnection: close\r\n",
-                        resp.status,
-                        resp.body.len()
-                    );
-                    for (k, v) in &resp.headers {
-                        let _ = write!(out, "{k}: {v}\r\n");
-                    }
-                    out.push_str("\r\n");
-                    out.push_str(&resp.body);
-                    let _ = sock.write_all(out.as_bytes()).await;
+                    reply(&mut sock, &resp).await;
                     let _ = sock.shutdown().await;
                 });
             }
@@ -159,13 +166,45 @@ impl MockServer {
         }
     }
 
+    pub fn requests(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+
     pub fn bearers(&self) -> Vec<String> {
-        self.seen.lock().unwrap().iter().map(|s| s.bearer.clone()).collect()
+        self.seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.bearer.clone())
+            .collect()
     }
 
     #[allow(dead_code)]
     pub fn remaining(&self) -> usize {
         self.script.lock().unwrap().len()
+    }
+}
+
+async fn reply(sock: &mut tokio::net::TcpStream, script: &Scripted) {
+    let mut head = format!(
+        "HTTP/1.1 {} MOCK\r\ncontent-length: {}\r\nconnection: close\r\n",
+        script.status,
+        script.body.len()
+    );
+    for (k, v) in &script.headers {
+        let _ = write!(head, "{k}: {v}\r\n");
+    }
+    head.push_str("\r\n");
+    let mut bytes = head.into_bytes();
+    let body_start = bytes.len();
+    bytes.extend_from_slice(script.body.as_bytes());
+    let cut = script.split_at.map_or(bytes.len(), |at| body_start + at);
+    let (first, second) = bytes.split_at(cut);
+    let _ = sock.write_all(first).await;
+    if !second.is_empty() {
+        let _ = sock.flush().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = sock.write_all(second).await;
     }
 }
 

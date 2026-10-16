@@ -1,5 +1,4 @@
-//! Integration tests for the hardcoded HTTP semantics table, driven through
-//! the full `AiClient` stack against an in-process mock server.
+//! The HTTP retry table, driven through the whole client.
 
 mod support;
 
@@ -117,9 +116,11 @@ async fn bad_request_fails_fast_without_rotation() {
 
     // Both keys must still be active.
     let metas = c.manager().list_keys().await.unwrap();
-    assert!(metas
-        .iter()
-        .all(|m| matches!(m.status, ai_pool::KeyStatus::Active)));
+    assert!(
+        metas
+            .iter()
+            .all(|m| matches!(m.status, ai_pool::KeyStatus::Active))
+    );
 }
 
 #[tokio::test]
@@ -246,4 +247,182 @@ async fn idempotent_seeding_no_duplicates() {
     assert_eq!(c.manager().list_keys().await.unwrap().len(), 1);
     c.manager().add_key("sk-same-key-123").await.unwrap();
     assert_eq!(c.manager().list_keys().await.unwrap().len(), 1);
+}
+
+async fn status_of(c: &AiClient) -> Vec<ai_pool::KeyStatus> {
+    let metas = c.manager().list_keys().await.unwrap();
+    metas.into_iter().map(|m| m.status).collect()
+}
+
+#[tokio::test]
+async fn keys_that_cannot_work_are_banned_and_rotated_past() {
+    let bodies = [
+        (402, r#"{"error":{"message":"Insufficient credits"}}"#),
+        (
+            400,
+            r#"{"error":{"message":"API key not valid. Please pass a valid API key.","status":"INVALID_ARGUMENT"}}"#,
+        ),
+        (
+            429,
+            r#"{"error":{"message":"You exceeded your current quota","code":"insufficient_quota"}}"#,
+        ),
+    ];
+    for (status, body) in bodies {
+        let server =
+            MockServer::start(vec![Scripted::json(status, body), Scripted::ok_chat("ok")]).await;
+        let c = client(
+            &server.url,
+            &["sk-dead-key-01", "sk-live-key-02"],
+            RotationMode::Reactive,
+        )
+        .await;
+        let resp = c.chat(chat_payload()).await.unwrap();
+        assert_eq!(resp.choices[0].message.content, "ok", "status {status}");
+        let statuses = status_of(&c).await;
+        assert!(
+            statuses
+                .iter()
+                .any(|s| matches!(s, ai_pool::KeyStatus::Banned { .. })),
+            "status {status} should ban: {statuses:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_ordinary_bad_request_still_fails_fast() {
+    let server = MockServer::start(vec![Scripted::json(
+        400,
+        r#"{"error":{"message":"Unknown parameter: foo"}}"#,
+    )])
+    .await;
+    let c = client(
+        &server.url,
+        &["sk-fine-key-001", "sk-fine-key-002"],
+        RotationMode::Proactive,
+    )
+    .await;
+    assert!(matches!(
+        c.chat(chat_payload()).await,
+        Err(AiError::BadRequest { status: 400, .. })
+    ));
+    assert_eq!(server.requests().len(), 1);
+}
+
+#[tokio::test]
+async fn request_timeouts_are_retried_on_the_same_key() {
+    let server = MockServer::start(vec![
+        Scripted::json(408, "{}"),
+        Scripted::ok_chat("second time lucky"),
+    ])
+    .await;
+    let c = client(&server.url, &["sk-only-key-01"], RotationMode::Proactive).await;
+    let resp = c.chat(chat_payload()).await.unwrap();
+    assert_eq!(resp.choices[0].message.content, "second time lucky");
+    assert_eq!(server.bearers(), vec!["sk-only-key-01", "sk-only-key-01"]);
+}
+
+#[tokio::test]
+async fn keyless_clients_send_no_authorization() {
+    let server = MockServer::start(vec![Scripted::ok_chat("local")]).await;
+    let c = AiClient::builder()
+        .default_url(&server.url)
+        .keyless()
+        .header("X-Title", "mareader")
+        .build()
+        .await
+        .unwrap();
+    let resp = c.chat(chat_payload()).await.unwrap();
+    assert_eq!(resp.choices[0].message.content, "local");
+    let seen = &server.requests()[0];
+    assert!(seen.headers.iter().all(|(k, _)| k != "authorization"));
+    assert!(
+        seen.headers
+            .contains(&("x-title".into(), "mareader".into()))
+    );
+}
+
+#[tokio::test]
+async fn a_keyless_rate_limit_reports_when_to_retry() {
+    let server = MockServer::start(vec![
+        Scripted::json(429, "{}").with_header("retry-after", "7"),
+    ])
+    .await;
+    let c = AiClient::builder()
+        .default_url(&server.url)
+        .keyless()
+        .build()
+        .await
+        .unwrap();
+    match c.chat(chat_payload()).await {
+        Err(
+            e @ AiError::AllKeysExhausted {
+                retry_in_ms: Some(7000),
+            },
+        ) => {
+            assert!(e.is_retryable());
+        }
+        other => panic!("expected exhaustion with a wait, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_named_auth_header_carries_the_key() {
+    let server = MockServer::start(vec![Scripted::ok_chat("ok")]).await;
+    let c = AiClient::builder()
+        .default_url(&server.url)
+        .auth(ai_pool::Auth::Header("x-goog-api-key".into()))
+        .api_key("AIza-header-key-1")
+        .build()
+        .await
+        .unwrap();
+    c.chat(chat_payload()).await.unwrap();
+    let seen = &server.requests()[0];
+    assert!(
+        seen.headers
+            .contains(&("x-goog-api-key".into(), "AIza-header-key-1".into()))
+    );
+    assert!(seen.headers.iter().all(|(k, _)| k != "authorization"));
+}
+
+#[tokio::test]
+async fn an_invalid_header_is_a_config_error() {
+    let built = AiClient::builder().header("bad header", "x").build().await;
+    assert!(matches!(built, Err(AiError::InvalidConfig(_))));
+}
+
+#[tokio::test]
+async fn models_are_listed_sorted_without_prefixes() {
+    let server = MockServer::start(vec![Scripted::json(
+        200,
+        r#"{"object":"list","data":[{"id":"models/gemini-2.5-pro"},{"id":"gemini-2.5-flash","owned_by":"google"}]}"#,
+    )])
+    .await;
+    let c = client(&server.url, &["sk-list-models-1"], RotationMode::Proactive).await;
+    let ids: Vec<String> = c
+        .models()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(ids, ["gemini-2.5-flash", "gemini-2.5-pro"]);
+    assert!(server.requests()[0].line.starts_with("GET /v1/models "));
+}
+
+#[tokio::test]
+async fn pasted_keys_are_trimmed_and_blank_ones_refused() {
+    let server = MockServer::start(vec![Scripted::ok_chat("ok")]).await;
+    let c = client(
+        &server.url,
+        &["  ", "sk-padded-key-1\n"],
+        RotationMode::Proactive,
+    )
+    .await;
+    assert_eq!(c.manager().list_keys().await.unwrap().len(), 1);
+    assert!(matches!(
+        c.manager().add_key(" \n").await,
+        Err(AiError::InvalidConfig(_))
+    ));
+    c.chat(chat_payload()).await.unwrap();
+    assert_eq!(server.bearers(), vec!["sk-padded-key-1"]);
 }

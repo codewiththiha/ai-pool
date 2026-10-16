@@ -5,14 +5,14 @@ use std::time::Duration;
 
 use secrecy::SecretString;
 
-use crate::config::{PoolConfig, RotationMode};
+use crate::config::{Auth, PoolConfig, RotationMode};
 use crate::crypto::{Envelope, MasterKeyProvider};
 use crate::engine::{KeyPool, KeySeed};
 use crate::error::AiError;
 use crate::http::dispatcher::Dispatcher;
-use crate::http::models::ChatResponse;
+use crate::http::models::{ChatResponse, ModelInfo};
 use crate::quota::KeyLimits;
-use crate::storage::{memory::MemoryStore, KeyManager, KeyStore, Vault};
+use crate::storage::{KeyManager, KeyStore, Vault, memory::MemoryStore};
 
 #[cfg(feature = "stream")]
 use crate::http::stream::ChatStream;
@@ -25,10 +25,7 @@ enum StoreChoice {
     Custom(Arc<dyn KeyStore>),
 }
 
-/// Fault-tolerant, key-pooling AI API client.
-///
-/// Cheap to clone (the internals are behind `Arc`s), so it can be shared
-/// freely across tasks or stored in application state.
+/// A key-pooling client for OpenAI-compatible APIs; cheap to clone.
 #[derive(Clone)]
 pub struct AiClient {
     dispatcher: Arc<Dispatcher>,
@@ -47,8 +44,7 @@ impl AiClient {
         AiClientBuilder::default()
     }
 
-    /// Non-streaming OpenAI-compatible chat completion. Picks a healthy key
-    /// from the pool, injects it, and applies the full retry/rotation policy.
+    /// Chat completion through the pool, with rotation and retries.
     pub async fn chat(&self, payload: serde_json::Value) -> Result<ChatResponse, AiError> {
         self.dispatcher.chat(payload).await
     }
@@ -59,28 +55,17 @@ impl AiClient {
         self.dispatcher.chat_stream(payload).await
     }
 
-    /// Developer control surface: CRUD, censored listings, explicit
-    /// decryption, ban/recover.
+    /// The models the endpoint offers, e.g. to fill a picker.
+    pub async fn models(&self) -> Result<Vec<ModelInfo>, AiError> {
+        self.dispatcher.models().await
+    }
+
+    /// Key management: add, list censored, decrypt, ban, recover.
     pub const fn manager(&self) -> &KeyManager {
         &self.manager
     }
 
-    /// Starts a fluent, type-safe request builder, as an alternative to
-    /// passing raw JSON to [`Self::chat`].
-    ///
-    /// ```no_run
-    /// # use ai_pool::{AiClient, ThinkingConfig, ReasoningEffort};
-    /// # async fn run(client: &AiClient) -> Result<(), ai_pool::AiError> {
-    /// let text = client
-    ///     .chat_builder()
-    ///     .model("gemini-2.0-flash")
-    ///     .user("hello")
-    ///     .thinking(ThinkingConfig::Effort(ReasoningEffort::High))
-    ///     .send_text()
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
+    /// A typed request builder instead of raw JSON.
     pub fn chat_builder(&self) -> crate::sdk::ChatBuilder<'_> {
         crate::sdk::ChatBuilder::new(self)
     }
@@ -92,6 +77,7 @@ impl AiClient {
 pub struct AiClientBuilder {
     config: PoolConfig,
     store: StoreChoice,
+    scope: String,
     master: MasterKeyProvider,
     seed_keys: Vec<(String, Option<KeyLimits>)>,
 }
@@ -101,6 +87,7 @@ impl Default for AiClientBuilder {
         Self {
             config: PoolConfig::default(),
             store: StoreChoice::Memory,
+            scope: String::new(),
             master: MasterKeyProvider::Ephemeral,
             seed_keys: Vec::new(),
         }
@@ -111,6 +98,29 @@ impl AiClientBuilder {
     /// Base URL of the OpenAI-compatible API.
     pub fn default_url(mut self, url: impl Into<String>) -> Self {
         self.config.default_url = url.into();
+        self
+    }
+
+    /// How keys are sent; [`Auth::None`] needs no keys at all.
+    pub fn auth(mut self, auth: Auth) -> Self {
+        self.config.auth = auth;
+        self
+    }
+
+    /// Shorthand for [`Auth::None`]: local servers like Ollama.
+    pub fn keyless(self) -> Self {
+        self.auth(Auth::None)
+    }
+
+    /// Adds a header to every request, e.g. `OpenRouter`'s `X-Title`.
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.config.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Deadline for establishing a connection (default 10 s).
+    pub const fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.config.connect_timeout = timeout;
         self
     }
 
@@ -157,6 +167,12 @@ impl AiClientBuilder {
         self
     }
 
+    /// Separates this client's rows from other scopes in the same file.
+    pub fn key_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = scope.into();
+        self
+    }
+
     /// Bring your own [`KeyStore`] implementation.
     pub fn custom_store(mut self, store: Arc<dyn KeyStore>) -> Self {
         self.store = StoreChoice::Custom(store);
@@ -169,8 +185,7 @@ impl AiClientBuilder {
         self
     }
 
-    /// Seed API keys. Ids are deterministic hashes of the plaintext, so
-    /// re-running the builder after an app restart never creates duplicates.
+    /// Seeds keys; ids hash the plaintext, so reseeding never duplicates.
     pub fn api_keys<I, S>(mut self, keys: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -186,41 +201,22 @@ impl AiClientBuilder {
         self
     }
 
-    /// Seeds a key with its own quota limits (overrides the pool default).
-    ///
-    /// ```no_run
-    /// # use ai_pool::{AiClient, KeyLimits};
-    /// # let b = AiClient::builder();
-    /// b.api_key_with_limits(
-    ///     "sk-...",
-    ///     KeyLimits::none().per_minute(5).per_hour(100),
-    /// );
-    /// ```
-    pub fn api_key_with_limits(
-        mut self,
-        key: impl Into<String>,
-        limits: KeyLimits,
-    ) -> Self {
+    /// Seeds a key with its own quota limits.
+    pub fn api_key_with_limits(mut self, key: impl Into<String>, limits: KeyLimits) -> Self {
         self.seed_keys.push((key.into(), Some(limits)));
         self
     }
 
-    /// Default quota limits for every key that has no per-key limits.
-    /// Each key still tracks its own windows independently.
+    /// Limits for keys without their own; each key counts separately.
     pub const fn default_key_limits(mut self, limits: KeyLimits) -> Self {
         self.config.default_limits = limits;
         self
     }
 
-    /// Resolves the master key, opens the store, seeds keys idempotently,
-    /// decrypts everything into RAM, and wires up the dispatcher.
+    /// Resolves the master key, opens the store, seeds and loads keys.
     ///
-    /// Fails with [`AiError::InvalidConfig`] when a `max_concurrency` limit
-    /// is combined with [`RotationMode::Proactive`]: proactive round-robin
-    /// already spreads load, so per-key concurrency splitting only applies
-    /// to reactive mode.
+    /// `max_concurrency` limits need [`RotationMode::Reactive`].
     pub async fn build(self) -> Result<AiClient, AiError> {
-        // 0. Config validation: concurrency limits are reactive-only.
         if self.config.rotation_mode == RotationMode::Proactive {
             let conflicting = self.config.default_limits.max_concurrency.is_some()
                 || self
@@ -229,43 +225,39 @@ impl AiClientBuilder {
                     .any(|(_, l)| l.is_some_and(|l| l.max_concurrency.is_some()));
             if conflicting {
                 return Err(AiError::InvalidConfig(
-                    "max_concurrency limits require RotationMode::Reactive;                      proactive mode already rotates keys per request"
-                        .into(),
+                    "max_concurrency limits require RotationMode::Reactive".into(),
                 ));
             }
         }
 
-        // 1. Master key (may hit the OS keychain → VaultError::KeychainLocked).
-        let master = self.master.resolve()?;
-        let envelope = Envelope::new(master);
-
-        // 2. Storage backend.
-        #[cfg(feature = "sqlite")]
-        let mut sqlite_pool_handle: Option<sqlx::SqlitePool> = None;
+        // The OS store may prompt or wait on D-Bus.
+        let master = self.master;
+        let resolved = tokio::task::spawn_blocking(move || master.resolve())
+            .await
+            .map_err(|e| AiError::InvalidConfig(format!("master key task: {e}")))??;
+        let envelope = Envelope::new(resolved.key);
 
         let store: Arc<dyn KeyStore> = match self.store {
             StoreChoice::Memory => Arc::new(MemoryStore::new()),
             StoreChoice::Custom(store) => store,
             #[cfg(feature = "sqlite")]
             StoreChoice::Sqlite(path) => {
-                let s = crate::storage::sqlite::SqliteStore::open(&path).await?;
-                sqlite_pool_handle = Some(s.pool().clone());
-                Arc::new(s)
+                Arc::new(crate::storage::sqlite::SqliteStore::open(&path, &self.scope).await?)
             }
         };
-        let vault = Vault::new(store, envelope);
+        let vault = Vault::new(store, envelope).fresh_master(resolved.fresh);
 
-        // 3. Idempotent seeding (INSERT OR IGNORE keeps existing rows and
-        //    their persisted quota windows).
+        // Existing rows keep their health and quota windows.
         for (plaintext, limits) in &self.seed_keys {
+            let plaintext = plaintext.trim();
+            if plaintext.is_empty() {
+                continue;
+            }
             let id = crate::crypto::deterministic_id(plaintext);
-            let secret = SecretString::from(plaintext.clone());
+            let secret = SecretString::from(plaintext.to_string());
             vault.insert_plain(&id, &secret, *limits).await?;
         }
 
-        // 4. Decrypt everything into the live pool. Tampered rows are banned
-        //    and skipped without crashing; persisted hour windows are summed
-        //    up if still current, reset if their time passed.
         let pool = Arc::new(KeyPool::new(
             self.config.rotation_mode,
             self.config.default_limits,
@@ -279,22 +271,12 @@ impl AiClientBuilder {
             );
         }
 
-        // Re-validate against persisted limits loaded from the vault.
-        if self.config.rotation_mode == RotationMode::Proactive
-            && pool.any_concurrency_limit()
-        {
+        if self.config.rotation_mode == RotationMode::Proactive && pool.any_concurrency_limit() {
             return Err(AiError::InvalidConfig(
-                "a persisted key carries max_concurrency, which requires                  RotationMode::Reactive"
-                    .into(),
+                "a stored key has max_concurrency, which needs RotationMode::Reactive".into(),
             ));
         }
 
-        #[cfg(feature = "sqlite")]
-        if let Some(p) = sqlite_pool_handle {
-            pool.register_sqlite_pool(p);
-        }
-
-        // 5. Dispatcher + manager.
         let dispatcher = Arc::new(Dispatcher::new(
             Arc::clone(&pool),
             vault.clone(),

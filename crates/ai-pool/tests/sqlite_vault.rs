@@ -1,5 +1,4 @@
-//! `SQLite` vault tests (feature = "sqlite"): persistence across restarts,
-//! idempotent seeding, and tamper detection via AES-GCM authentication.
+//! The `SQLite` vault: restarts, scopes, migration and tampering.
 
 #![cfg(feature = "sqlite")]
 
@@ -86,21 +85,16 @@ async fn tampered_row_is_banned_not_crashing() {
 
     // Attacker flips bytes in one encrypted blob directly in SQLite.
     {
-        use sqlx::sqlite::SqlitePoolOptions;
-        let pool = SqlitePoolOptions::new()
-            .connect(&format!("sqlite://{}", db.display()))
-            .await
-            .unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
         let victim_id = ai_pool::crypto::deterministic_id("sk-tamper-victim-1");
-        sqlx::query("UPDATE ai_pool_keys SET ciphertext = X'DEADBEEF' || ciphertext WHERE id = ?")
-            .bind(&victim_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
+        conn.execute(
+            "UPDATE ai_pool_keys_v3 SET ciphertext = X'DEADBEEF' || ciphertext WHERE id = ?1",
+            [&victim_id],
+        )
+        .unwrap();
     }
 
-    // Restart: app must NOT crash; victim is banned as corrupted, honest key loads.
+    // Restart: the victim is banned, the honest key loads.
     let c = open(&db, &[]).await;
     let metas = c.manager().list_keys().await.unwrap();
     assert_eq!(metas.len(), 2);
@@ -138,24 +132,113 @@ async fn wrong_master_key_bans_everything_gracefully() {
         .await
         .unwrap();
     let metas = c.manager().list_keys().await.unwrap();
-    assert!(matches!(
-        metas[0].status,
-        ai_pool::KeyStatus::Banned { .. }
-    ));
+    assert!(matches!(metas[0].status, ai_pool::KeyStatus::Banned { .. }));
 }
 
 #[tokio::test]
-async fn raw_sqlite_pool_escape_hatch() {
+async fn scopes_share_a_file_without_seeing_each_other() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("keys.db");
-    let c = open(&db, &["sk-escape-hatch-1"]).await;
+    let scoped = |scope: &'static str, keys: &'static [&'static str]| {
+        let db = db.clone();
+        async move {
+            AiClient::builder()
+                .default_url("http://127.0.0.1:1/v1")
+                .sqlite_store(&db)
+                .key_scope(scope)
+                .master_key_provider(MasterKeyProvider::custom_from_slice(&[3u8; 32]).unwrap())
+                .api_keys(keys.iter().copied())
+                .build()
+                .await
+                .unwrap()
+        }
+    };
+    let openai = scoped("openai", &["sk-openai-aaaa-1", "sk-openai-bbbb-2"]).await;
+    let gemini = scoped("gemini", &["AIza-gemini-cccc-3", "sk-openai-aaaa-1"]).await;
+    assert_eq!(openai.manager().list_keys().await.unwrap().len(), 2);
+    assert_eq!(gemini.manager().list_keys().await.unwrap().len(), 2);
+    let id = ai_pool::crypto::deterministic_id("sk-openai-aaaa-1");
+    gemini.manager().remove_key(&id).await.unwrap();
+    assert_eq!(
+        scoped("openai", &[])
+            .await
+            .manager()
+            .list_keys()
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        scoped("gemini", &[])
+            .await
+            .manager()
+            .list_keys()
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+}
 
-    let pool = c.manager().raw_sqlite_pool().expect("sqlite-backed");
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ai_pool_keys")
-        .fetch_one(&pool)
+#[tokio::test]
+async fn unscoped_rows_from_0_2_are_migrated() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("keys.db");
+    open(&db, &["sk-migrate-me-0001"]).await;
+    {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ai_pool_keys AS SELECT id, ciphertext, censored, status, ban_reason,
+               cooldown_until_ms, limits_json, minute_start_ms, minute_used, hour_start_ms,
+               hour_used, created_at_ms FROM ai_pool_keys_v3;
+             DELETE FROM ai_pool_keys_v3;",
+        )
+        .unwrap();
+    }
+    let c = open(&db, &[]).await;
+    let metas = c.manager().list_keys().await.unwrap();
+    assert_eq!(metas.len(), 1);
+    assert!(matches!(metas[0].status, ai_pool::KeyStatus::Active));
+}
+
+#[tokio::test]
+async fn a_lost_master_key_bans_rows_until_the_key_is_added_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("keys.db");
+    let master = dir.path().join("master.key");
+    let client = || {
+        AiClient::builder()
+            .default_url("http://127.0.0.1:1/v1")
+            .sqlite_store(&db)
+            .master_key_provider(MasterKeyProvider::File(master.clone()))
+            .build()
+    };
+    client()
+        .await
+        .unwrap()
+        .manager()
+        .add_key("sk-will-be-lost-01")
         .await
         .unwrap();
-    assert_eq!(count.0, 1);
+    std::fs::remove_file(&master).unwrap();
+
+    let c = client().await.unwrap();
+    let metas = c.manager().list_keys().await.unwrap();
+    match &metas[0].status {
+        ai_pool::KeyStatus::Banned { reason } => assert_eq!(reason, ai_pool::LOST_MASTER_KEY),
+        other => panic!("expected a ban, got {other:?}"),
+    }
+    c.manager().add_key(" sk-will-be-lost-01\n").await.unwrap();
+    let metas = c.manager().list_keys().await.unwrap();
+    assert_eq!(metas.len(), 1);
+    assert!(matches!(metas[0].status, ai_pool::KeyStatus::Active));
+    let id = ai_pool::crypto::deterministic_id("sk-will-be-lost-01");
+    let secret = c.manager().get_decrypted_key(&id).await.unwrap();
+    assert_eq!(
+        ai_pool::ExposeSecret::expose_secret(&secret),
+        "sk-will-be-lost-01"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -228,23 +311,15 @@ async fn stale_persisted_window_resets_on_load() {
 
     // Manually persist an hour window whose time has long passed.
     {
-        use sqlx::sqlite::SqlitePoolOptions;
-        let pool = SqlitePoolOptions::new()
-            .connect(&format!("sqlite://{}", db.display()))
-            .await
-            .unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
         let id = ai_pool::crypto::deterministic_id("sk-stale-win-0001");
         let limits = serde_json::to_string(&KeyLimits::none().per_hour(5)).unwrap();
-        sqlx::query(
-            "UPDATE ai_pool_keys SET limits_json = ?, hour_start_ms = 1000, hour_used = 5 \
-             WHERE id = ?",
+        conn.execute(
+            "UPDATE ai_pool_keys_v3 SET limits_json = ?1, hour_start_ms = 1000, hour_used = 5 \
+             WHERE id = ?2",
+            [&limits, &id],
         )
-        .bind(limits)
-        .bind(&id)
-        .execute(&pool)
-        .await
         .unwrap();
-        pool.close().await;
     }
 
     // Reload: the expired window must NOT block the key.

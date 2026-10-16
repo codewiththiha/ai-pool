@@ -1,8 +1,4 @@
-//! Key storage: the vault.
-//!
-//! The [`KeyStore`] trait only deals with **encrypted blobs and metadata**.
-//! It knows nothing about HTTP or AI models. Encryption/decryption happens in
-//! [`Vault`], which pairs a store with an [`Envelope`](crate::crypto::Envelope).
+//! The vault: sealed records in a [`KeyStore`], opened with an envelope.
 
 pub mod memory;
 #[cfg(feature = "sqlite")]
@@ -116,8 +112,7 @@ pub struct KeyRecord {
     pub id: String,
     /// `nonce || AES-256-GCM ciphertext+tag` of the plaintext API key.
     pub ciphertext: Vec<u8>,
-    /// Censored representation kept alongside the blob so the UI never needs
-    /// to decrypt just to render `sk-proj-...8f92`.
+    /// Display text, so listing keys never decrypts.
     pub censored: String,
     /// Current health.
     pub health: KeyHealth,
@@ -132,8 +127,7 @@ pub struct KeyRecord {
 }
 
 impl KeyRecord {
-    /// Drops persisted windows whose time has already passed, so stale
-    /// usage never carries into a new window after a restart.
+    /// Drops persisted windows whose time has passed.
     pub(crate) fn expire_stale_windows(&mut self, now_ms: i64) {
         if self
             .minute_window
@@ -175,7 +169,11 @@ pub trait KeyStore: Send + Sync {
 pub struct Vault {
     store: std::sync::Arc<dyn KeyStore>,
     envelope: Envelope,
+    fresh_master: bool,
 }
+
+/// Ban reason of keys sealed by a master key that no longer exists.
+pub const LOST_MASTER_KEY: &str = "master key lost; add the key again";
 
 /// A decrypted key ready to be loaded into the Engine.
 pub struct DecryptedKey {
@@ -198,7 +196,18 @@ pub struct DecryptedKey {
 impl Vault {
     /// Pairs a storage backend with the envelope that seals its blobs.
     pub fn new(store: std::sync::Arc<dyn KeyStore>, envelope: Envelope) -> Self {
-        Self { store, envelope }
+        Self {
+            store,
+            envelope,
+            fresh_master: false,
+        }
+    }
+
+    /// Marks the master key as just created, so old rows read as lost.
+    #[must_use]
+    pub const fn fresh_master(mut self, fresh: bool) -> Self {
+        self.fresh_master = fresh;
+        self
     }
 
     /// The underlying storage backend.
@@ -206,7 +215,7 @@ impl Vault {
         &self.store
     }
 
-    /// Seals `plaintext` and inserts it under `id`.
+    /// Seals `plaintext` under `id`; re-adding heals a row of a lost key.
     pub async fn insert_plain(
         &self,
         id: &str,
@@ -214,6 +223,14 @@ impl Vault {
         limits: Option<KeyLimits>,
     ) -> Result<KeyRecord, VaultError> {
         use secrecy::ExposeSecret;
+        match self.store.get(id).await {
+            Ok(existing) if self.envelope.open(&existing.ciphertext).is_ok() => {
+                return Ok(existing);
+            }
+            Ok(_) => self.store.delete(id).await?,
+            Err(VaultError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
         let record = KeyRecord {
             id: id.to_string(),
             ciphertext: self.envelope.seal(plaintext)?,
@@ -228,9 +245,7 @@ impl Vault {
         Ok(record)
     }
 
-    /// Loads and decrypts every record. Records that fail GCM authentication
-    /// (tampered rows) are marked `Banned("corrupted")` in the store and
-    /// **skipped** instead of crashing the app.
+    /// Decrypts every record; rows that fail are banned and skipped.
     pub async fn load_all_decrypted(&self) -> Result<Vec<DecryptedKey>, VaultError> {
         let records = self.store.load_all().await?;
         let now_ms = crate::quota::now_ms();
@@ -248,16 +263,16 @@ impl Vault {
                     hour_window: rec.hour_window,
                 }),
                 Err(VaultError::Corrupted(why)) => {
-                    tracing::warn!(key_id = %rec.id, %why, "vault record corrupted; banning key");
-                    let _ = self
-                        .store
-                        .update_health(
-                            &rec.id,
-                            KeyHealth::Banned {
-                                reason: format!("corrupted: {why}"),
-                            },
-                        )
-                        .await;
+                    let reason = if self.fresh_master {
+                        LOST_MASTER_KEY.to_string()
+                    } else {
+                        format!("corrupted: {why}")
+                    };
+                    tracing::warn!(key_id = %rec.id, %reason, "undecryptable key banned");
+                    let banned = KeyHealth::Banned { reason };
+                    if let Err(e) = self.store.update_health(&rec.id, banned).await {
+                        tracing::warn!(key_id = %rec.id, error = %e, "ban not persisted");
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -272,10 +287,7 @@ impl Vault {
     }
 }
 
-/// Strictly increasing unix-ms timestamps, so keys inserted in the same
-/// millisecond keep their insertion order in `load_all` (`ORDER BY
-/// created_at_ms`). Reactive mode depends on this: the first-seeded key is
-/// the first failover candidate.
+/// Strictly increasing unix milliseconds, so insertion order is stable.
 fn monotonic_now_ms() -> i64 {
     use std::sync::atomic::{AtomicI64, Ordering};
     static LAST: AtomicI64 = AtomicI64::new(0);

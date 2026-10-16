@@ -36,17 +36,14 @@ pub struct Choice {
 pub struct Message {
     /// `system`, `user`, `assistant`, ...
     pub role: String,
-    /// Message text content.
-    ///
-    /// Normalized from the provider's wire form: a plain JSON string is used
-    /// as-is, while an array of content parts (Gemini-style
-    /// `[{"type":"text","text":"..."}]`) is collapsed to the concatenated
-    /// text. Non-text parts (image/audio) are skipped.
+    /// Text content; arrays of content parts are joined, non-text skipped.
     pub content: String,
+    /// The model's explanation when it declined a structured request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
 }
 
-/// A raw content part as some OpenAI-compatible providers emit it inside
-/// `message.content` (an array of `{type, text,...}` objects).
+/// One `{type, text}` part of an array-shaped `content`.
 #[derive(Debug, Clone, Deserialize)]
 struct ContentPart {
     #[serde(default, rename = "type")]
@@ -60,7 +57,7 @@ impl<'de> serde::Deserialize<'de> for Message {
     where
         D: serde::Deserializer<'de>,
     {
-        // An untagged enum lets us accept either a plain string or a part array.
+        // Content is a string or an array of parts.
         #[derive(Deserialize)]
         #[serde(untagged)]
         enum Content {
@@ -73,6 +70,8 @@ impl<'de> serde::Deserialize<'de> for Message {
             role: String,
             #[serde(default)]
             content: Option<Content>,
+            #[serde(default)]
+            refusal: Option<String>,
         }
 
         let raw = Raw::deserialize(deserializer)?;
@@ -89,13 +88,10 @@ impl<'de> serde::Deserialize<'de> for Message {
         Ok(Self {
             role: raw.role,
             content,
+            refusal: raw.refusal.filter(|r| !r.trim().is_empty()),
         })
     }
 }
-
-// Serialized `Message`s still need a plain `String` content for outgoing
-// requests, which the derived `Serialize` above already provides (only the
-// `Deserialize` direction is normalized).
 
 #[cfg(test)]
 mod tests {
@@ -139,8 +135,12 @@ mod tests {
         let m = Message {
             role: "user".into(),
             content: "hi".into(),
+            refusal: None,
         };
-        assert_eq!(serde_json::to_string(&m).unwrap(), r#"{"role":"user","content":"hi"}"#);
+        assert_eq!(
+            serde_json::to_string(&m).unwrap(),
+            r#"{"role":"user","content":"hi"}"#
+        );
     }
 }
 
@@ -213,8 +213,7 @@ pub struct ApiErrorBody {
     /// Human-readable error message.
     #[serde(default)]
     pub message: String,
-    /// Providers send this as a number (`"code": 429`) or string
-    /// (`"code": "429"` / `"rate_limit_exceeded"`), so accept anything.
+    /// The code as a number, from numeric, string or named forms.
     #[serde(default)]
     pub code: Option<serde_json::Value>,
     /// Provider-specific error type tag.
@@ -262,5 +261,68 @@ impl ApiErrorBody {
         } else {
             None
         }
+    }
+}
+
+/// One entry of `GET /models`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// The id to pass as `model`.
+    pub id: String,
+    /// The organisation the provider names, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned_by: Option<String>,
+}
+
+/// `GET /models`, as OpenAI-compatible servers answer it.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ModelList {
+    #[serde(default)]
+    data: Vec<ModelInfo>,
+    /// Some servers answer with `models` instead of `data`.
+    #[serde(default)]
+    models: Vec<ModelInfo>,
+}
+
+impl ModelList {
+    /// Every entry, ids without Gemini's `models/` prefix.
+    pub(crate) fn into_models(self) -> Vec<ModelInfo> {
+        self.data
+            .into_iter()
+            .chain(self.models)
+            .map(|mut m| {
+                if let Some(id) = m.id.strip_prefix("models/") {
+                    m.id = id.to_string();
+                }
+                m
+            })
+            .filter(|m| !m.id.trim().is_empty())
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod model_list_tests {
+    use super::*;
+
+    #[test]
+    fn reads_openai_and_gemini_shapes() {
+        let list: ModelList = serde_json::from_str(
+            r#"{"object":"list","data":[{"id":"models/gemini-2.5-flash","owned_by":"google"},{"id":""}]}"#,
+        )
+        .unwrap();
+        let models = list.into_models();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "gemini-2.5-flash");
+    }
+
+    #[test]
+    fn refusals_are_kept_and_blank_ones_dropped() {
+        let m: Message =
+            serde_json::from_str(r#"{"role":"assistant","content":null,"refusal":"no"}"#).unwrap();
+        assert_eq!(m.refusal.as_deref(), Some("no"));
+        let m: Message =
+            serde_json::from_str(r#"{"role":"assistant","content":"x","refusal":" "}"#).unwrap();
+        assert_eq!(m.refusal, None);
     }
 }

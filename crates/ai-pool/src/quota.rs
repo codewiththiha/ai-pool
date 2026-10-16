@@ -1,21 +1,4 @@
-//! Per-key quota intelligence: optional minute/hour rate windows and
-//! per-key concurrency limits.
-//!
-//! # Window semantics
-//!
-//! A window starts at the key's **first use** (usage starts from 0) and lasts
-//! a fixed length (60 s / 60 min). Usage counts up per leased request; when
-//! it reaches the limit the key is unusable until `start + length`, at which
-//! point the next use begins a fresh window. All timestamps are unix
-//! milliseconds so hour windows survive persistence: a reloaded window keeps
-//! summing if still current, or resets if its time has passed.
-//!
-//! # Live introspection
-//!
-//! [`WindowInfo`] / [`KeyQuotaInfo`] are serializable snapshots (used,
-//! remaining, `resets_at_ms`, `resets_in_ms`) surfaced through
-//! `KeyManager::list_keys`, which is enough to drive a live usage dashboard
-//! or countdown timer.
+//! Per-key quotas: minute and hour windows and a concurrency cap.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -37,8 +20,7 @@ pub(crate) fn now_ms() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-/// Optional per-key limits. Every field is independent: a key can have any
-/// combination, or none at all (unlimited).
+/// Per-key limits; each field is optional and independent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeyLimits {
     /// Max requests per rolling minute window (starts at first use).
@@ -47,16 +29,10 @@ pub struct KeyLimits {
     /// Max requests per rolling hour window (persisted across restarts).
     #[serde(default)]
     pub per_hour: Option<u32>,
-    /// Max concurrent in-flight requests on this key.
-    ///
-    /// Only meaningful in `RotationMode::Reactive` (proactive mode already
-    /// spreads load); combining it with proactive mode is a build error.
+    /// Concurrent requests on this key; reactive rotation only.
     #[serde(default)]
     pub max_concurrency: Option<u32>,
-    /// Rare use case: when a lease attempt finds this key saturated, put it
-    /// into a health `Cooldown` for this many milliseconds so its reusable
-    /// time becomes observable/deterministic. Without this, a saturated key
-    /// becomes reusable the instant any in-flight request completes.
+    /// Cooldown applied when a lease finds this key saturated.
     #[serde(default)]
     pub concurrency_cooldown_ms: Option<u64>,
 }
@@ -132,9 +108,7 @@ impl WindowState {
     }
 }
 
-/// Is a request currently allowed under this window + limit?
-///
-/// `None` limit = unlimited. An expired window counts as fresh.
+/// Whether this window allows another request under `limit`.
 pub(crate) const fn window_usable(
     window: Option<WindowState>,
     limit: Option<u32>,

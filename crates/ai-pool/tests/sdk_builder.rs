@@ -1,6 +1,8 @@
 //! Tests for `ChatBuilder`: payload construction (thinking config, schemas,
 //! sampling) and end-to-end structured-output deserialization.
 
+#![cfg(feature = "derive")]
+
 mod support;
 
 use std::time::Duration;
@@ -72,7 +74,12 @@ async fn payload_maps_thinking_disabled_as_null() {
         .into_json();
     assert!(payload["reasoning_effort"].is_null());
     // The key must be PRESENT (explicit null), not absent.
-    assert!(payload.as_object().unwrap().contains_key("reasoning_effort"));
+    assert!(
+        payload
+            .as_object()
+            .unwrap()
+            .contains_key("reasoning_effort")
+    );
 }
 
 #[tokio::test]
@@ -189,6 +196,7 @@ async fn builder_send_stream_sets_stream_flag() {
         status: 200,
         headers: vec![("content-type".into(), "text/event-stream".into())],
         body: sse_body.into(),
+        split_at: None,
     }])
     .await;
     let c = client(&server.url).await;

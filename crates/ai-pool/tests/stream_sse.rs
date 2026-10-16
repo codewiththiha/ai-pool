@@ -21,13 +21,12 @@ fn sse(events: &[&str]) -> Scripted {
         status: 200,
         headers: vec![("content-type".into(), "text/event-stream".into())],
         body,
+        split_at: None,
     }
 }
 
 fn chunk(text: &str) -> String {
-    format!(
-        r#"{{"id":"c1","choices":[{{"index":0,"delta":{{"content":"{text}"}}}}]}}"#
-    )
+    format!(r#"{{"id":"c1","choices":[{{"index":0,"delta":{{"content":"{text}"}}}}]}}"#)
 }
 
 async fn client(url: &str, keys: &[&str]) -> AiClient {
@@ -144,4 +143,46 @@ async fn pre_stream_429_still_rotates_keys() {
     let first = stream.next().await.unwrap().unwrap();
     assert_eq!(first.choices[0].delta.content.as_deref(), Some("ok"));
     assert_eq!(server.bearers().len(), 2);
+}
+
+#[tokio::test]
+async fn characters_split_across_frames_survive() {
+    let body = sse(&[&chunk("မြန်မာ"), "[DONE]"]);
+    // Cut inside the first three-byte Myanmar letter.
+    let cut = body.body.find('မ').unwrap() + 1;
+    let server = MockServer::start(vec![body.split_at(cut)]).await;
+    let c = client(&server.url, &["sk-stream-utf8-1"]).await;
+    let mut stream = c
+        .chat_stream(serde_json::json!({"model":"m","messages":[]}))
+        .await
+        .unwrap();
+    let mut text = String::new();
+    while let Some(item) = stream.next().await {
+        if let Some(delta) = item
+            .unwrap()
+            .choices
+            .first()
+            .and_then(|c| c.delta.content.clone())
+        {
+            text.push_str(&delta);
+        }
+    }
+    assert_eq!(text, "မြန်မာ");
+}
+
+#[tokio::test]
+async fn keyless_streams_work() {
+    let server = MockServer::start(vec![sse(&[&chunk("hi"), "[DONE]"])]).await;
+    let c = AiClient::builder()
+        .default_url(&server.url)
+        .keyless()
+        .build()
+        .await
+        .unwrap();
+    let mut stream = c
+        .chat_stream(serde_json::json!({"model":"m","messages":[]}))
+        .await
+        .unwrap();
+    let first = stream.next().await.unwrap().unwrap();
+    assert_eq!(first.choices[0].delta.content.as_deref(), Some("hi"));
 }

@@ -1,29 +1,22 @@
-//! SSE parsing (feature = "stream"): `data:` framing, `[DONE]` handling, and
-//! mid-stream error detection.
-//!
-//! Edge case handled: the API returns 200 OK, starts streaming, then injects
-//! `{"error": {"code": 429, ...}}` *inside* the stream. The parser catches
-//! it, aborts the stream, marks the key `Cooldown`/`Banned` accordingly, and
-//! yields `AiError::StreamInterrupted(...)`.
+//! Server-sent events. A mid-stream error ends the stream and cools
+//! down or bans its key.
 
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::stream::Stream;
 use futures_util::StreamExt;
+use futures_util::stream::Stream;
 
 use crate::error::{AiError, StreamInterruption};
-use crate::http::dispatcher::Dispatcher;
+use crate::http::dispatcher::{Call, Dispatcher};
 use crate::http::models::{ApiErrorEnvelope, ChatChunk};
 
-/// A stream of parsed completion chunks. Ends after `[DONE]` or the first
-/// fatal error.
+/// Parsed chunks; ends after `[DONE]` or the first error.
 pub type ChatStream = Pin<Box<dyn Stream<Item = Result<ChatChunk, AiError>> + Send>>;
 
 impl Dispatcher {
-    /// Streaming chat completion. Forces `"stream": true` into the payload
-    /// and parses the SSE response into [`ChatChunk`]s.
+    /// Streaming chat completion; forces `"stream": true`.
     pub async fn chat_stream(
         self: &Arc<Self>,
         mut payload: serde_json::Value,
@@ -32,11 +25,11 @@ impl Dispatcher {
             obj.insert("stream".into(), serde_json::Value::Bool(true));
         }
         let url = self.config.chat_completions_url();
-        let (key, resp) = self.execute(&url, &payload, true).await?;
+        let (key, resp) = self.execute(&url, Call::Stream(&payload)).await?;
 
         let parser = SseParser {
             dispatcher: Arc::clone(self),
-            key_id: key.id.clone(),
+            key_id: key.as_ref().map(|k| k.id.clone()),
             default_cooldown: self.config.default_cooldown,
         };
 
@@ -44,13 +37,12 @@ impl Dispatcher {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ChatChunk, AiError>>(64);
 
         tokio::spawn(async move {
-            // Hold the lease for the whole stream: the request stays
-            // in-flight against the key's concurrency quota until the SSE
-            // connection finishes or the consumer drops the stream.
+            // The lease counts against the key's concurrency until the end.
             let _lease = key;
-            let mut buf = String::new();
+            let mut buf: Vec<u8> = Vec::new();
             'outer: while let Some(frame) = bytes.next().await {
-                match frame {
+                let chunk = match frame {
+                    Ok(chunk) => chunk,
                     Err(e) => {
                         let err = if e.is_timeout() {
                             AiError::Timeout
@@ -58,31 +50,29 @@ impl Dispatcher {
                             AiError::Network(e)
                         };
                         let _ = tx.send(Err(err)).await;
-                        break 'outer;
+                        break;
                     }
-                    Ok(chunk) => {
-                        buf.push_str(&String::from_utf8_lossy(&chunk));
-                        // Process every complete line; keep the partial tail.
-                        while let Some(nl) = buf.find('\n') {
-                            let line: String = buf.drain(..=nl).collect();
-                            match parser.handle_line(line.trim_end()).await {
-                                LineOutcome::Ignore => {}
-                                LineOutcome::Done => break 'outer,
-                                LineOutcome::Chunk(c) => {
-                                    if tx.send(Ok(c)).await.is_err() {
-                                        break 'outer; // receiver dropped
-                                    }
-                                }
-                                LineOutcome::Fatal(e) => {
-                                    let _ = tx.send(Err(e)).await;
-                                    break 'outer;
-                                }
+                };
+                buf.extend_from_slice(&chunk);
+                // Split on bytes: a character may straddle two frames.
+                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    let raw: Vec<u8> = buf.drain(..=nl).collect();
+                    let line = String::from_utf8_lossy(&raw);
+                    match parser.handle_line(line.trim_end()).await {
+                        LineOutcome::Ignore => {}
+                        LineOutcome::Done => break 'outer,
+                        LineOutcome::Chunk(c) => {
+                            if tx.send(Ok(c)).await.is_err() {
+                                break 'outer;
                             }
+                        }
+                        LineOutcome::Fatal(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            break 'outer;
                         }
                     }
                 }
             }
-            // tx drops here -> stream ends.
         });
 
         Ok(Box::pin(futures_util::stream::unfold(rx, |mut rx| async {
@@ -100,13 +90,12 @@ enum LineOutcome {
 
 struct SseParser {
     dispatcher: Arc<Dispatcher>,
-    key_id: String,
+    key_id: Option<String>,
     default_cooldown: Duration,
 }
 
 impl SseParser {
-    /// Parses one SSE line. Only `data:` lines carry payloads; comments
-    /// (`:`), `event:` lines, and blank keep-alives are ignored.
+    /// Parses one line; only `data:` lines carry payloads.
     async fn handle_line(&self, line: &str) -> LineOutcome {
         let Some(data) = line.strip_prefix("data:") else {
             return LineOutcome::Ignore;
@@ -119,19 +108,21 @@ impl SseParser {
             return LineOutcome::Done;
         }
 
-        // Mid-stream error injection (the 200-then-429 trap).
         if let Ok(env) = serde_json::from_str::<ApiErrorEnvelope>(data) {
             let interruption = match env.error.numeric_code() {
                 Some(429) => {
-                    self.dispatcher
-                        .cooldown_key(&self.key_id, self.default_cooldown)
-                        .await;
+                    if let Some(id) = &self.key_id {
+                        self.dispatcher
+                            .cooldown_key(id, self.default_cooldown)
+                            .await;
+                    }
                     StreamInterruption::RateLimited
                 }
                 Some(401 | 403) => {
-                    self.dispatcher
-                        .ban_key(&self.key_id, &format!("mid-stream: {}", env.error.message))
-                        .await;
+                    if let Some(id) = &self.key_id {
+                        let reason = format!("mid-stream: {}", env.error.message);
+                        self.dispatcher.ban_key(id, &reason).await;
+                    }
                     StreamInterruption::Unauthorized
                 }
                 _ => StreamInterruption::Api(env.error.message.clone()),

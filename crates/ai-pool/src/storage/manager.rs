@@ -1,6 +1,4 @@
-//! The `KeyManager`: the administrative surface over the vault and the live
-//! pool. Everything it returns by default is censored; plaintext keys only
-//! leave the vault through the one method that exists for that purpose.
+//! [`KeyManager`]: administration over the vault and the live pool.
 
 use std::sync::Arc;
 
@@ -12,8 +10,7 @@ use crate::engine::KeyPool;
 use crate::error::AiError;
 use crate::quota::{KeyLimits, KeyQuotaInfo};
 
-/// Censored key info, safe to serialize and expose to untrusted layers
-/// such as a UI process or a log line. Never contains plaintext secrets.
+/// Censored key info, safe to show and serialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyMetadata {
     /// Stable key id.
@@ -46,8 +43,7 @@ impl KeyManager {
     // Listing
     // ------------------------------------------------------------------
 
-    /// Returns every key with censored display text, live health, and quota
-    /// usage. The result contains no secrets and can be serialized as-is.
+    /// Every key, censored, with live health and quota.
     pub async fn list_keys(&self) -> Result<Vec<KeyMetadata>, AiError> {
         let records = self.vault.store().load_all().await?;
         Ok(records
@@ -56,7 +52,9 @@ impl KeyManager {
                 // Prefer the live in-RAM health (cooldowns tick in real time).
                 let health = self.pool.health_of(&rec.id).unwrap_or(rec.health);
                 let quota = self.pool.quota_of(&rec.id).filter(|q| {
-                    q.minute.is_some() || q.hour.is_some() || q.max_concurrency.is_some()
+                    q.minute.is_some()
+                        || q.hour.is_some()
+                        || q.max_concurrency.is_some()
                         || q.in_flight > 0
                 });
                 KeyMetadata {
@@ -74,10 +72,7 @@ impl KeyManager {
     // Explicit decryption
     // ------------------------------------------------------------------
 
-    /// Decrypts a single key on demand, for the rare flows that genuinely
-    /// need the plaintext (say, letting a user view or edit a stored key).
-    /// The value comes back wrapped in [`SecretString`]; call
-    /// `.expose_secret()` only at the last possible moment.
+    /// Decrypts one key on demand, e.g. to let the user copy it.
     pub async fn get_decrypted_key(&self, id: &str) -> Result<SecretString, AiError> {
         Ok(self.vault.decrypt_one(id).await?)
     }
@@ -86,8 +81,7 @@ impl KeyManager {
     // Key management
     // ------------------------------------------------------------------
 
-    /// Encrypts and stores a new key, loads it into the live pool, and
-    /// returns its generated (deterministic) id.
+    /// Seals, stores and pools a key; returns its id.
     pub async fn add_key(&self, plaintext_key: &str) -> Result<String, AiError> {
         self.add_key_with_limits(plaintext_key, None).await
     }
@@ -103,36 +97,35 @@ impl KeyManager {
             && self.pool.mode() == crate::config::RotationMode::Proactive
         {
             return Err(AiError::InvalidConfig(
-                "max_concurrency limits require RotationMode::Reactive;                  proactive mode already spreads load"
-                    .into(),
+                "max_concurrency limits require RotationMode::Reactive".into(),
             ));
+        }
+        // Pasted keys often carry a newline.
+        let plaintext_key = plaintext_key.trim();
+        if plaintext_key.is_empty() {
+            return Err(AiError::InvalidConfig("an API key cannot be empty".into()));
         }
         let id = crate::crypto::deterministic_id(plaintext_key);
         let secret = SecretString::from(plaintext_key.to_string());
         let record = self.vault.insert_plain(&id, &secret, limits).await?;
         self.pool.upsert(
             crate::engine::KeySeed::new(record.id, secret, record.censored)
-                .limits(record.limits),
+                .health(record.health)
+                .limits(record.limits)
+                .windows(record.minute_window, record.hour_window),
         );
         Ok(id)
     }
 
-    /// Live quota snapshot for one key: minute/hour window usage,
-    /// `resets_at_ms` / `resets_in_ms` for realtime countdowns, in-flight
-    /// count, and the concurrency cap.
+    /// A live quota snapshot for one key.
     pub fn key_quota(&self, id: &str) -> Result<KeyQuotaInfo, AiError> {
         self.pool
             .quota_of(id)
             .ok_or_else(|| AiError::KeyNotFound(id.to_string()))
     }
 
-    /// Replaces a key's quota limits (live + persisted). Windows keep their
-    /// current usage; only the caps change.
-    pub async fn set_key_limits(
-        &self,
-        id: &str,
-        limits: Option<KeyLimits>,
-    ) -> Result<(), AiError> {
+    /// Replaces a key's limits live and on disk; windows keep counting.
+    pub async fn set_key_limits(&self, id: &str, limits: Option<KeyLimits>) -> Result<(), AiError> {
         if limits.is_some_and(|l| l.max_concurrency.is_some())
             && self.pool.mode() == crate::config::RotationMode::Proactive
         {
@@ -186,13 +179,4 @@ impl KeyManager {
     // ------------------------------------------------------------------
     // Escape hatch
     // ------------------------------------------------------------------
-
-    /// Direct access to the underlying `sqlx::SqlitePool` if the vault is
-    /// SQLite-backed. Returns `None` for other backends.
-    #[cfg(feature = "sqlite")]
-    pub fn raw_sqlite_pool(&self) -> Option<sqlx::SqlitePool> {
-        // Downcast through Any is not available on trait objects without
-        // extra plumbing; the SqliteStore registers its pool at build time.
-        self.pool.raw_sqlite_pool()
-    }
 }

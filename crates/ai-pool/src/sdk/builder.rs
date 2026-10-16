@@ -1,49 +1,44 @@
-//! The [`ChatBuilder`] type-state builder.
-//!
-//! The second type parameter `T` tracks what [`ChatBuilder::send`] returns:
-//!
-//! - `ChatBuilder<'_, Unstructured>` (the default from
-//!   [`crate::AiClient::chat_builder`]) — `send()` returns the raw
-//!   [`ChatResponse`]; `send_text()` returns the first choice's content.
-//! - `ChatBuilder<'_, U>` after calling
-//!   [`ChatBuilder::response_format_schema::<U>`] — `send()` deserializes the
-//!   model's JSON reply straight into `U`.
+//! [`ChatBuilder`]: `send` returns a [`ChatResponse`] until a schema types it.
 
 use std::marker::PhantomData;
 
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
+use super::strict::{make_strict, schema_name};
 use crate::client::AiClient;
 use crate::error::AiError;
-use crate::http::models::{ChatResponse, Message};
+use crate::http::models::{ChatResponse, Choice, Message};
 
 #[cfg(feature = "stream")]
 use crate::http::stream::ChatStream;
 
-/// Type-state marker for a builder without a structured-output schema.
-///
-/// Deliberately **not** `Deserialize`: this is what lets the compiler give
-/// `send()` different return types for structured vs. unstructured builders
-/// without overlapping impls.
+/// Marker: `send` returns the raw [`ChatResponse`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Unstructured;
 
-/// Reasoning effort level for OpenAI-style reasoning models (o1/o3/gpt-5).
+/// How hard a reasoning model thinks; sent as `reasoning_effort`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[non_exhaustive]
 pub enum ReasoningEffort {
-    /// Low reasoning effort (fastest, cheapest).
+    /// No reasoning where the model allows it (Gemini 2.5 Flash, GPT-5.1).
+    None,
+    /// The least reasoning a model that always reasons supports.
+    Minimal,
+    /// Light reasoning.
     Low,
-    /// Medium reasoning effort.
+    /// Balanced reasoning.
     Medium,
-    /// High reasoning effort (deepest thinking).
+    /// Thorough reasoning.
     High,
 }
 
 impl ReasoningEffort {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
             Self::High => "high",
@@ -51,47 +46,50 @@ impl ReasoningEffort {
     }
 }
 
-/// How model reasoning ("thinking") should be requested from the provider.
-///
-/// The builder translates each variant into the exact JSON the major
-/// OpenAI-compatible providers expect:
-///
-/// | Variant | Injected JSON |
-/// |---|---|
-/// | `Effort(High)` | `"reasoning_effort": "high"` (OpenAI o1/o3) |
-/// | `Enabled { budget_tokens: Some(1024) }` | `"thinking": {"thinking_budget": 1024}` (Gemini / DeepSeek) |
-/// | `Enabled { budget_tokens: None }` | `"thinking": {}` |
-/// | `Disabled` | `"reasoning_effort": null` (explicitly off) |
+/// Reasoning controls; providers differ, so pick the form yours reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThinkingConfig {
-    /// Explicitly disable reasoning on models that default to it.
+    /// Sends `"reasoning_effort": null`.
     Disabled,
-    /// Gemini/DeepSeek-style thinking block with an optional token budget.
+    /// Sends a `thinking` object with an optional `thinking_budget`.
     Enabled {
-        /// Maximum tokens the model may spend thinking, if supported.
+        /// Token budget for reasoning.
         budget_tokens: Option<u32>,
     },
-    /// OpenAI-style `reasoning_effort` knob.
+    /// Sends `reasoning_effort`.
     Effort(ReasoningEffort),
 }
 
-/// Desired response format.
+/// The shape of the answer.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ResponseFormat {
-    /// Plain text (`{"type": "text"}`).
+    /// Free text.
     Text,
-    /// Any valid JSON object (`{"type": "json_object"}`).
+    /// Any JSON object; the prompt must describe the shape.
     Json,
-    /// Strict JSON conforming to a schema (`{"type": "json_schema", ...}`).
+    /// JSON matching `schema`.
     JsonSchema {
-        /// Schema name reported to the provider.
+        /// Schema name; sanitised to what the API accepts.
         name: String,
-        /// The JSON schema document.
+        /// A JSON Schema; property descriptions act as per-field prompts.
         schema: Value,
+        /// Close objects and require every field; providers then enforce it.
+        strict: bool,
     },
 }
 
-/// Fluent, type-safe request builder returned by [`AiClient::chat_builder`].
+impl ResponseFormat {
+    /// A strict JSON Schema format.
+    pub fn json_schema(name: impl Into<String>, schema: Value) -> Self {
+        Self::JsonSchema {
+            name: name.into(),
+            schema,
+            strict: true,
+        }
+    }
+}
+
+/// A chat request under construction; see the module docs.
 #[must_use = "call one of the send methods to execute the request"]
 #[derive(Clone)]
 pub struct ChatBuilder<'a, T = Unstructured> {
@@ -101,6 +99,7 @@ pub struct ChatBuilder<'a, T = Unstructured> {
     temperature: Option<f64>,
     top_p: Option<f64>,
     max_tokens: Option<u32>,
+    max_completion_tokens: Option<u32>,
     thinking: Option<ThinkingConfig>,
     response_format: Option<ResponseFormat>,
     extra: Map<String, Value>,
@@ -121,10 +120,6 @@ impl<T> std::fmt::Debug for ChatBuilder<'_, T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Fluent configuration (available in every type-state)
-// ---------------------------------------------------------------------------
-
 impl<'a, T> ChatBuilder<'a, T> {
     pub(crate) fn new(client: &'a AiClient) -> Self {
         Self {
@@ -134,6 +129,7 @@ impl<'a, T> ChatBuilder<'a, T> {
             temperature: None,
             top_p: None,
             max_tokens: None,
+            max_completion_tokens: None,
             thinking: None,
             response_format: None,
             extra: Map::new(),
@@ -167,6 +163,7 @@ impl<'a, T> ChatBuilder<'a, T> {
         self.messages.push(Message {
             role: role.into(),
             content: content.into(),
+            refusal: None,
         });
         self
     }
@@ -189,6 +186,12 @@ impl<'a, T> ChatBuilder<'a, T> {
         self
     }
 
+    /// Cap as `max_completion_tokens`, which `OpenAI` reasoning models need.
+    pub const fn max_completion_tokens(mut self, max: u32) -> Self {
+        self.max_completion_tokens = Some(max);
+        self
+    }
+
     /// Configures model reasoning. See [`ThinkingConfig`] for how each
     /// variant maps onto provider-specific JSON.
     pub const fn thinking(mut self, config: ThinkingConfig) -> Self {
@@ -196,10 +199,7 @@ impl<'a, T> ChatBuilder<'a, T> {
         self
     }
 
-    /// Sets an explicit [`ResponseFormat`] without changing the output type.
-    ///
-    /// Prefer [`Self::response_format_schema`] for schema-driven typed
-    /// output; use this for `Text` / `Json` or a hand-built schema.
+    /// Sets a [`ResponseFormat`] without typing the builder.
     pub fn response_format(mut self, format: ResponseFormat) -> Self {
         self.response_format = Some(format);
         self
@@ -212,25 +212,32 @@ impl<'a, T> ChatBuilder<'a, T> {
         self
     }
 
-    /// Requests **structured output** conforming to the JSON schema derived
-    /// from `U` (via `#[derive(JsonSchema)]`, re-exported from [`schemars`]).
-    ///
-    /// Doc comments on `U`'s fields become `"description"` entries in the
-    /// schema — per-field prompts the model follows when filling them in.
-    ///
-    /// Returns a builder **typed to `U`**, so a later
-    /// [`ChatBuilder::send`] deserializes the reply into `U` with no
-    /// turbofish at the call site.
-    pub fn response_format_schema<U: schemars::JsonSchema>(
+    /// Asks for JSON matching any JSON Schema; `send` parses it into `U`.
+    pub fn response_json_schema<U: DeserializeOwned>(
+        self,
+        name: impl Into<String>,
+        schema: Value,
+    ) -> ChatBuilder<'a, U> {
+        self.typed(ResponseFormat::json_schema(name, schema))
+    }
+
+    /// Asks for any JSON object, for servers without schema support.
+    pub fn response_json<U: DeserializeOwned>(self) -> ChatBuilder<'a, U> {
+        self.typed(ResponseFormat::Json)
+    }
+
+    /// Asks for JSON matching `U`'s derived schema; doc comments guide fields.
+    #[cfg(feature = "derive")]
+    pub fn response_format_schema<U: schemars::JsonSchema + DeserializeOwned>(
         self,
         name: impl Into<String>,
     ) -> ChatBuilder<'a, U> {
         let root = schemars::schema_for!(U);
-        let mut schema = serde_json::to_value(root.schema).unwrap_or_else(|_| json!({}));
-        // Strict mode requires additionalProperties: false on objects.
-        if let Some(obj) = schema.as_object_mut() {
-            obj.entry("additionalProperties").or_insert(json!(false));
-        }
+        let schema = serde_json::to_value(root).unwrap_or_else(|_| json!({}));
+        self.response_json_schema(name, schema)
+    }
+
+    fn typed<U>(self, format: ResponseFormat) -> ChatBuilder<'a, U> {
         ChatBuilder {
             client: self.client,
             model: self.model,
@@ -238,17 +245,15 @@ impl<'a, T> ChatBuilder<'a, T> {
             temperature: self.temperature,
             top_p: self.top_p,
             max_tokens: self.max_tokens,
+            max_completion_tokens: self.max_completion_tokens,
             thinking: self.thinking,
-            response_format: Some(ResponseFormat::JsonSchema {
-                name: name.into(),
-                schema,
-            }),
+            response_format: Some(format),
             extra: self.extra,
             _output: PhantomData,
         }
     }
 
-    /// Assembles the final OpenAI-compatible JSON payload.
+    /// The OpenAI-compatible JSON body this builder sends.
     pub fn into_json(&self) -> Value {
         let mut payload = Map::new();
         if let Some(model) = &self.model {
@@ -267,6 +272,9 @@ impl<'a, T> ChatBuilder<'a, T> {
         if let Some(m) = self.max_tokens {
             payload.insert("max_tokens".into(), json!(m));
         }
+        if let Some(m) = self.max_completion_tokens {
+            payload.insert("max_completion_tokens".into(), json!(m));
+        }
         match self.thinking {
             Some(ThinkingConfig::Effort(effort)) => {
                 payload.insert("reasoning_effort".into(), json!(effort.as_str()));
@@ -283,27 +291,8 @@ impl<'a, T> ChatBuilder<'a, T> {
             }
             None => {}
         }
-        match &self.response_format {
-            Some(ResponseFormat::Text) => {
-                payload.insert("response_format".into(), json!({"type": "text"}));
-            }
-            Some(ResponseFormat::Json) => {
-                payload.insert("response_format".into(), json!({"type": "json_object"}));
-            }
-            Some(ResponseFormat::JsonSchema { name, schema }) => {
-                payload.insert(
-                    "response_format".into(),
-                    json!({
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": name,
-                            "strict": true,
-                            "schema": schema,
-                        }
-                    }),
-                );
-            }
-            None => {}
+        if let Some(format) = &self.response_format {
+            payload.insert("response_format".into(), format_json(format));
         }
         for (k, v) in &self.extra {
             payload.insert(k.clone(), v.clone());
@@ -312,76 +301,120 @@ impl<'a, T> ChatBuilder<'a, T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Execution: unstructured state
-// ---------------------------------------------------------------------------
+fn format_json(format: &ResponseFormat) -> Value {
+    match format {
+        ResponseFormat::Text => json!({"type": "text"}),
+        ResponseFormat::Json => json!({"type": "json_object"}),
+        ResponseFormat::JsonSchema {
+            name,
+            schema,
+            strict,
+        } => {
+            let mut schema = schema.clone();
+            if *strict {
+                make_strict(&mut schema);
+            }
+            if let Some(obj) = schema.as_object_mut() {
+                obj.remove("$schema");
+            }
+            json!({
+                "type": "json_schema",
+                "json_schema": { "name": schema_name(name), "strict": strict, "schema": schema }
+            })
+        }
+    }
+}
+
+/// The first choice, or why there is no usable one.
+fn first_choice(resp: ChatResponse) -> Result<Choice, AiError> {
+    let choice = resp
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| AiError::InvalidResponse("response contained no choices".into()))?;
+    if let Some(refusal) = &choice.message.refusal {
+        return Err(AiError::Refused(refusal.clone()));
+    }
+    Ok(choice)
+}
+
+fn cut_off(choice: &Choice) -> bool {
+    choice.finish_reason.as_deref() == Some("length")
+}
 
 impl ChatBuilder<'_, Unstructured> {
-    /// Executes the request and returns the full [`ChatResponse`].
+    /// Sends the request and returns the whole [`ChatResponse`].
     pub async fn send(self) -> Result<ChatResponse, AiError> {
         let payload = self.into_json();
         self.client.chat(payload).await
     }
 
-    /// Executes the request and returns the first choice's text content.
+    /// Sends the request and returns the first choice's text.
     pub async fn send_text(self) -> Result<String, AiError> {
-        let resp = self.send().await?;
-        resp.choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| AiError::InvalidResponse("response contained no choices".into()))
+        let choice = first_choice(self.send().await?)?;
+        if choice.message.content.is_empty() && cut_off(&choice) {
+            return Err(AiError::Truncated);
+        }
+        Ok(choice.message.content)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Execution: schema-typed state
-// ---------------------------------------------------------------------------
-
 impl<T: DeserializeOwned> ChatBuilder<'_, T> {
-    /// Executes the request and deserializes the model's JSON reply into `T`.
-    ///
-    /// Tolerates replies wrapped in markdown code fences. Parsing failures
-    /// map to [`AiError::InvalidResponse`].
+    /// Sends and parses the answer into `T`, past fences and prose.
     pub async fn send(self) -> Result<T, AiError> {
         let payload = self.into_json();
-        let resp = self.client.chat(payload).await?;
-        let text = resp
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message.content)
-            .ok_or_else(|| AiError::InvalidResponse("response contained no choices".into()))?;
-        let cleaned = strip_code_fences(&text);
-        serde_json::from_str::<T>(cleaned).map_err(|e| {
-            AiError::InvalidResponse(format!(
-                "failed to parse structured output: {e}; content: {}",
-                crate::http::dispatcher::truncate(cleaned, 300)
-            ))
+        let choice = first_choice(self.client.chat(payload).await?)?;
+        let text = choice.message.content.as_str();
+        parse_json::<T>(text).map_err(|e| {
+            if cut_off(&choice) {
+                AiError::Truncated
+            } else {
+                AiError::InvalidResponse(format!(
+                    "failed to parse structured output: {e}; content: {}",
+                    crate::http::dispatcher::truncate(text, 300)
+                ))
+            }
         })
     }
 }
 
-// ---------------------------------------------------------------------------
-// Execution: streaming (any state — chunks are always incremental text)
-// ---------------------------------------------------------------------------
-
 #[cfg(feature = "stream")]
 impl<T> ChatBuilder<'_, T> {
-    /// Executes the request as an SSE stream of [`crate::ChatChunk`]s.
+    /// Sends the request as a stream of [`crate::ChatChunk`]s.
     pub async fn send_stream(self) -> Result<ChatStream, AiError> {
         let payload = self.into_json();
         self.client.chat_stream(payload).await
     }
 }
 
-/// Strips ```` ```json ... ``` ```` fences some models wrap JSON in.
+/// Parses `text` as `T`, else its fenced or outermost JSON value.
+fn parse_json<T: DeserializeOwned>(text: &str) -> Result<T, serde_json::Error> {
+    let fenced = strip_code_fences(text);
+    serde_json::from_str::<T>(fenced).or_else(|first| {
+        outermost_json(fenced)
+            .and_then(|inner| serde_json::from_str::<T>(inner).ok())
+            .ok_or(first)
+    })
+}
+
+/// The span from the first `{` or `[` to the last matching closer.
+fn outermost_json(text: &str) -> Option<&str> {
+    let start = text.find(['{', '['])?;
+    let closer = if text.get(start..)?.starts_with('{') {
+        '}'
+    } else {
+        ']'
+    };
+    let end = text.rfind(closer)?;
+    text.get(start..=end)
+}
+
+/// Strips the ```` ```json ```` fences some models wrap JSON in.
 fn strip_code_fences(text: &str) -> &str {
     let trimmed = text.trim();
     let Some(rest) = trimmed.strip_prefix("```") else {
         return trimmed;
     };
-    // Drop the language tag line (e.g. "json").
     let rest = rest.split_once('\n').map_or(rest, |(_, body)| body);
     rest.strip_suffix("```").unwrap_or(rest).trim()
 }
@@ -389,6 +422,19 @@ fn strip_code_fences(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, serde::Deserialize, PartialEq)]
+    struct Word {
+        word: String,
+    }
+
+    #[test]
+    fn json_is_found_inside_prose() {
+        let parsed: Word = parse_json("Sure! {\"word\": \"ox\"} Hope that helps.").unwrap();
+        assert_eq!(parsed.word, "ox");
+        assert!(parse_json::<Word>("no json here").is_err());
+        assert!(parse_json::<Word>("} backwards {").is_err());
+    }
 
     #[test]
     fn strip_fences() {

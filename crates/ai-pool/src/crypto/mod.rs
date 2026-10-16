@@ -1,24 +1,12 @@
-//! Envelope encryption logic (AES-256-GCM).
-//!
-//! The Vault never writes a plaintext API key to disk. Each record is sealed
-//! with the 32-byte Master Key using AES-256-GCM (authenticated encryption)
-//! under a fresh random 12-byte nonce. The stored blob layout is:
-//!
-//! ```text
-//! [ 12-byte nonce | ciphertext + 16-byte GCM tag ]
-//! ```
-//!
-//! Because GCM is *authenticated*, flipping a single byte of the `SQLite` blob
-//! makes decryption fail with [`VaultError::Corrupted`] rather than yielding
-//! garbage — the Vault marks that key `Banned("corrupted")` and moves on.
+//! AES-256-GCM envelope encryption: blobs are `nonce || ciphertext+tag`.
 
 pub mod master_key;
 
-pub use master_key::MasterKeyProvider;
+pub use master_key::{MasterKeyProvider, ResolvedKey};
 
 use aes_gcm::{
-    aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit},
 };
 use rand::RngCore;
 use secrecy::{ExposeSecret, SecretBox, SecretString};
@@ -28,9 +16,7 @@ use crate::error::VaultError;
 /// Length of the AES-GCM nonce prefix in the stored blob.
 pub const NONCE_LEN: usize = 12;
 
-/// Stateless helper that seals/opens API keys with the Master Key.
-///
-/// The Master Key itself lives inside [`SecretBox`] and is zeroized on drop.
+/// Seals and opens API keys with the master key.
 pub struct Envelope {
     master: SecretBox<[u8; 32]>,
 }
@@ -72,10 +58,7 @@ impl Envelope {
         Ok(blob)
     }
 
-    /// Decrypts a `nonce || ciphertext+tag` blob back into a [`SecretString`].
-    ///
-    /// Returns [`VaultError::Corrupted`] if the blob fails GCM authentication
-    /// (database tampering or a rotated master key).
+    /// Opens a `nonce || ciphertext+tag` blob; failures mean tampering.
     pub fn open(&self, blob: &[u8]) -> Result<SecretString, VaultError> {
         if blob.len() < NONCE_LEN + 16 {
             return Err(VaultError::Corrupted("blob too short".into()));
@@ -94,9 +77,7 @@ impl Envelope {
     }
 }
 
-/// Deterministic id for a plaintext key (idempotent seeding): if the builder
-/// runs again after an app restart, the same key hashes to the same id and no
-/// duplicate row is inserted.
+/// A stable id from the plaintext, so reseeding finds the same row.
 pub fn deterministic_id(plaintext: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(plaintext.as_bytes());

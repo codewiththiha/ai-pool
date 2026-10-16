@@ -1,53 +1,50 @@
-//! `thiserror` definitions for the two error domains:
-//! - [`VaultError`]: storage and cryptography failures
-//! - [`AiError`]: everything callers see from the public API
+//! Error types. Match on variants; messages are for people.
 
 use thiserror::Error;
 
-/// Errors originating in the Vault layer (storage backends + envelope encryption).
+/// Failures of the key vault: master key, encryption and storage.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum VaultError {
-    /// The OS keychain is locked or unavailable (a common state on macOS
-    /// after sleep). Callers should prompt the user to unlock and retry.
-    #[error("OS keychain is locked or unavailable")]
-    KeychainLocked,
+    /// The OS credential store refused access or is not running.
+    #[error("OS keychain is locked or unavailable: {0}")]
+    KeychainLocked(String),
 
-    /// Any other keychain failure.
+    /// Any other credential store failure.
     #[error("keychain error: {0}")]
     Keychain(String),
 
-    /// AES-GCM encryption/decryption failure that is *not* a tamper event.
+    /// The cipher failed while sealing.
     #[error("crypto failure: {0}")]
     Crypto(String),
 
-    /// AES-256-GCM authentication failed: the encrypted blob was modified on
-    /// disk (database tampering) or the master key changed. The offending key
-    /// is marked `Banned("corrupted")` instead of crashing the app.
+    /// A record failed authentication: tampered, or sealed by another key.
     #[error("encrypted record corrupted or tampered with: {0}")]
     Corrupted(String),
 
-    /// Storage backend failure (`SQLite` I/O, pool errors, ...).
+    /// The backing store failed.
     #[error("storage error: {0}")]
     Storage(String),
 
-    /// No record with this id exists in the store.
+    /// No record has this id.
     #[error("key not found in vault: {0}")]
     NotFound(String),
 
-    /// A custom master key was provided that is not exactly 32 bytes.
+    /// A master key that is not exactly 32 bytes of hex or raw data.
     #[error("master key must be exactly 32 bytes")]
     InvalidMasterKey,
 }
 
-/// Reason a stream was aborted mid-flight.
+/// Why a stream that had started ended early.
 #[cfg(feature = "stream")]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StreamInterruption {
-    /// The provider injected a 429-style error object inside the SSE stream.
+    /// The provider reported a rate limit inside the stream.
     RateLimited,
-    /// The provider injected a 401/403-style error object inside the SSE stream.
+    /// The provider rejected the key inside the stream.
     Unauthorized,
-    /// Any other in-stream API error.
+    /// Any other error event.
     Api(String),
 }
 
@@ -62,76 +59,92 @@ impl std::fmt::Display for StreamInterruption {
     }
 }
 
-/// Errors returned by [`crate::AiClient`] and [`crate::KeyManager`].
+/// Everything a request can fail with.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AiError {
-    /// Every key in the pool is currently unusable (cooldown, ban, exhausted
-    /// rate window, or concurrency saturation).
-    ///
-    /// `retry_in_ms` is the soonest known recovery time: `Some(ms)` when a
-    /// cooldown or rate window is the blocker, `None` when recovery time is
-    /// unknowable (all banned, or saturated without a configured cooldown).
+    /// Every key is cooling down, over quota or banned, or none exist.
     #[error("all keys in the pool are exhausted (rate-limited, quota-blocked, or banned)")]
     AllKeysExhausted {
-        /// Milliseconds until the soonest key frees up, if knowable.
+        /// When the soonest key recovers; `None` when none will by itself.
         retry_in_ms: Option<u64>,
     },
 
-    /// The builder was configured invalidly (e.g. per-key `max_concurrency`
-    /// combined with `RotationMode::Proactive`).
+    /// The builder or a key manager call was given contradicting options.
     #[error("invalid configuration: {0}")]
     InvalidConfig(String),
 
-    /// The request timed out. The key is NOT rotated: the network is at fault.
+    /// The request outlived `request_timeout`.
     #[error("request timed out")]
     Timeout,
 
-    /// 400 / 404 / 422 — the request itself is wrong. Fail fast, never rotate.
+    /// The provider rejected the request itself (400, 404, 413, 422).
     #[error("bad request ({status}): {body}")]
     BadRequest {
-        /// HTTP status code.
+        /// HTTP status.
         status: u16,
-        /// Raw response body.
+        /// Response body, truncated.
         body: String,
     },
 
-    /// 5xx persisted after exponential-backoff retries on the same key.
+    /// 5xx responses outlasted the retries.
     #[error("upstream server error ({status}) after retries: {body}")]
     ServerError {
-        /// HTTP status code.
+        /// HTTP status.
         status: u16,
-        /// Raw response body.
+        /// Response body, truncated.
         body: String,
     },
 
-    /// A status code outside the hardcoded semantics table.
+    /// A status the retry table does not know.
     #[error("unexpected status ({status}): {body}")]
     UnexpectedStatus {
-        /// HTTP status code.
+        /// HTTP status.
         status: u16,
-        /// Raw response body.
+        /// Response body, truncated.
         body: String,
     },
 
-    /// Transport-level failure (DNS, TLS, connection reset, ...).
+    /// Connecting or transferring failed.
     #[error("network error: {0}")]
     Network(#[from] reqwest::Error),
 
-    /// 200 OK but the body could not be deserialized.
+    /// The body was not what the API promises.
     #[error("invalid response body: {0}")]
     InvalidResponse(String),
 
-    /// The SSE stream returned 200 OK, started streaming, then injected an
-    /// error object. The stream is aborted and the key's health updated.
+    /// The model declined to answer; carries its explanation.
+    #[error("the model refused: {0}")]
+    Refused(String),
+
+    /// The answer hit the token limit before it was complete.
+    #[error("the answer was cut off at the token limit")]
+    Truncated,
+
+    /// A started stream ended with an error event.
     #[cfg(feature = "stream")]
     #[error("stream interrupted: {0}")]
     StreamInterrupted(StreamInterruption),
 
-    /// Bubbled-up vault failure.
+    /// The key vault failed.
     #[error(transparent)]
     Vault(#[from] VaultError),
 
-    /// A `KeyManager` operation referenced an unknown key id.
+    /// No key has this id.
     #[error("key not found: {0}")]
     KeyNotFound(String),
+}
+
+impl AiError {
+    /// True when the same request may succeed later without changes.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::AllKeysExhausted { retry_in_ms } => retry_in_ms.is_some(),
+            Self::Timeout | Self::ServerError { .. } => true,
+            Self::Network(e) => e.is_connect() || e.is_timeout(),
+            #[cfg(feature = "stream")]
+            Self::StreamInterrupted(StreamInterruption::RateLimited) => true,
+            _ => false,
+        }
+    }
 }

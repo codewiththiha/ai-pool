@@ -1,304 +1,263 @@
 # ai-pool
 
-A fault-tolerant Rust client for OpenAI-compatible APIs with key pooling,
-automatic rotation, per-key rate quotas, and encrypted local key storage.
+A fault-tolerant Rust client for OpenAI-compatible APIs: key pooling,
+rotation, per-key rate quotas, and encrypted local key storage.
 
-`ai-pool` is for applications that hold a pool of API keys (often supplied by
-end users) and need requests to keep flowing when individual keys get rate
-limited, revoked, or the upstream has a bad day. Instead of handling those
-failures at every call site, you hand the pool a request and it picks a
-healthy key, retries where retrying makes sense, and rotates where it
-doesn't.
+Hand the pool a request; it picks a healthy key, retries where retrying
+helps, rotates where it doesn't, and tells you precisely why when nothing
+works. It speaks the OpenAI chat-completions dialect, so one client type
+covers OpenAI, Gemini, OpenRouter, local servers and anything else that
+dialect reaches.
 
 ## Features
 
-- **Key pooling and rotation** — round-robin across all keys, or sticky
-  failover that only moves off a key when it stops working.
-- **Sensible failure handling** — rate limits put a key on cooldown and
-  rotate, auth failures ban the key and rotate, server errors retry the same
-  key with backoff, and client errors fail fast without burning other keys.
-- **Per-key rate quotas** — optional per-minute and per-hour request limits
-  and per-key concurrency caps, tracked individually per key, with live
-  usage snapshots for building dashboards or countdowns.
-- **Encrypted storage** — keys are sealed with AES-256-GCM envelope
-  encryption before they touch disk. The master key can live in the OS
-  keychain, come from your own source, or stay in memory.
-- **Typed request builder** — build chat requests fluently, request strict
-  JSON-schema output derived from your own structs, and get replies
-  deserialized into them.
-- **Streaming** — SSE streaming with mid-stream error detection: a rate
-  limit injected into a live stream is caught, the key is cooled down, and
-  the stream ends with a typed error.
+- **Pooling and rotation**: round-robin across keys, or sticky failover.
+- **Failure handling**: rate limits cool a key down, dead keys are banned,
+  server errors retry with backoff, request errors fail fast.
+- **Per-key quotas**: per-minute and per-hour limits and concurrency caps,
+  with live usage snapshots for dashboards.
+- **Encrypted storage**: AES-256-GCM sealed keys in one SQLite file, scoped
+  per provider; the master key lives in the OS keychain, a file, or memory.
+- **Structured output** from any JSON Schema, strict-mode normalised; a
+  derive path is optional.
+- **Keyless mode** for Ollama, LM Studio and other local servers.
+- **Streaming** that survives characters split across network frames and
+  errors injected mid-stream.
 
 ## Installation
 
 ```toml
 [dependencies]
-ai-pool = { version = "0.2", features = ["sqlite", "os-keychain", "stream"] }
+ai-pool = { git = "https://github.com/codewiththiha/ai-pool", features = ["sqlite", "os-keychain", "stream"] }
 ```
-
-All features are optional. The default build keeps keys in memory and pulls
-in no database or keychain dependencies.
 
 | Feature | Enables | Extra dependencies |
 |---|---|---|
-| `sqlite` | Encrypted persistent key store | `sqlx` |
-| `os-keychain` | Master key in the OS keychain | `keyring` |
-| `stream` | SSE streaming (`chat_stream`) | `futures-util` |
+| `derive` (default) | `response_format_schema::<T>()` from `#[derive(JsonSchema)]` | `schemars` |
+| `sqlite` | Encrypted, scoped key store in one file | `rusqlite` (bundled SQLite) |
+| `os-keychain` | Master key in the macOS Keychain, Windows Credential Manager or Secret Service | `keyring` |
+| `stream` | SSE streaming (`chat_stream`, `send_stream`) | `futures-util` |
+
+On Linux the keychain uses the Secret Service over a pure-Rust D-Bus client,
+so no system libraries are needed and keys survive reboots.
 
 ## Quick start
 
-```rust
-use ai_pool::{AiClient, RotationMode};
-use std::time::Duration;
+```rust,ignore
+use ai_pool::AiClient;
 
-#[tokio::main]
-async fn main() -> Result<(), ai_pool::AiError> {
-    let client = AiClient::builder()
-        .default_url("https://api.openai.com/v1/")
-        .rotation_mode(RotationMode::Proactive)
-        .request_timeout(Duration::from_secs(60))
-        .api_keys(vec!["sk-first-key", "sk-second-key"])
-        .build()
-        .await?;
+let client = AiClient::builder()
+    .default_url("https://api.openai.com/v1/")
+    .api_keys(["sk-first-key", "sk-second-key"])
+    .build()
+    .await?;
 
-    let resp = client.chat(serde_json::json!({
-        "model": "gpt-4o-mini",
-        "messages": [{"role": "user", "content": "Hello!"}]
-    })).await?;
-
-    println!("{}", resp.choices[0].message.content);
-    Ok(())
-}
+let text = client
+    .chat_builder()
+    .model("gpt-4o-mini")
+    .user("Hello!")
+    .send_text()
+    .await?;
 ```
 
-Any OpenAI-compatible endpoint works: point `default_url` at OpenAI, Gemini's
-OpenAI-compatible endpoint, OpenRouter, a local server, and so on.
+## Providers
+
+One client per provider; `default_url` ends where `/chat/completions`
+would start.
+
+| Provider | `default_url` | Auth |
+|---|---|---|
+| OpenAI | `https://api.openai.com/v1/` | default (`Bearer`) |
+| Gemini | `https://generativelanguage.googleapis.com/v1beta/openai/` | default |
+| OpenRouter | `https://openrouter.ai/api/v1/` | default; add `.header("X-Title", "My App")` |
+| Ollama | `http://localhost:11434/v1/` | `.keyless()` |
+| LM Studio | `http://localhost:1234/v1/` | `.keyless()` |
+
+Providers that want the key in another header use
+`.auth(Auth::Header("api-key".into()))`. `client.models().await?` lists the
+models an endpoint offers, sorted, with Gemini's `models/` prefix removed:
+enough to fill a model picker.
 
 ## How failures are handled
-
-The retry policy is fixed and applies to every request:
 
 | Response | Action |
 |---|---|
 | 2xx | Return the response |
-| 429 | Put the key on cooldown (honoring `Retry-After`), rotate, retry |
-| 401 / 403 | Ban the key, rotate, retry |
-| 400 / 404 / 422 | Fail immediately; the request itself is wrong |
-| 5xx | Retry the same key with exponential backoff and jitter |
-| Timeout | Fail immediately; the key is not at fault |
+| 429 | Cool the key down (honouring `Retry-After`), rotate, retry |
+| 429 `insufficient_quota` | Ban the key: waiting will not refill it |
+| 401 / 402 / 403 | Ban the key, rotate, retry |
+| 400 naming an invalid key | Ban the key, rotate, retry (Gemini answers bad keys this way) |
+| 400 / 404 / 413 / 422 | Fail at once with `BadRequest`; the request itself is wrong |
+| 408 / 5xx | Retry the same key with exponential backoff and jitter |
+| Timeout | Fail at once; the key is not at fault |
 
-`Retry-After` accepts both wire forms defined by RFC 7231 — a number of
-seconds or an absolute `IMF-fixdate` (e.g. `Wed, 21 Oct 2015 07:28:00 GMT`) —
-and any resulting cooldown is clamped to a 1-hour ceiling so an odd value
-never takes a key offline unreasonably long.
+`Retry-After` may be seconds or an HTTP date; cooldowns are capped at an
+hour. When no key is usable, requests fail with
+`AiError::AllKeysExhausted { retry_in_ms }`: the soonest recovery, or `None`
+when only a person can fix it (every key banned, or none added).
+`AiError::is_retryable()` sorts errors worth retrying later from the rest.
 
-When every key is on cooldown, out of quota, or banned, requests fail with
-`AiError::AllKeysExhausted { retry_in_ms }`, where `retry_in_ms` is the
-soonest known recovery time (`None` if recovery time is unknowable, for
-example when every key is banned).
+Banned keys carry their reason. `manager().recover_key(id)` reinstates one.
 
 ## Rotation modes
 
-**Proactive** (default) advances an atomic cursor on every request, so
-concurrent load spreads evenly across all healthy keys.
+**Proactive** (default) advances a shared cursor per request, spreading
+concurrent load evenly.
 
-**Reactive** sticks to one key until it fails or runs out of quota, then
-fails over to the next. If a key has a concurrency cap, overflow requests
-spill to the next key immediately instead of queueing behind a rate limit
-error, and the primary key keeps its role once it has capacity again.
+**Reactive** stays on one key until it fails or runs out of quota. With a
+concurrency cap, overflow spills to the next key at once instead of queueing
+behind a rate limit, and the primary keeps its role when it has room again.
 
 ## Per-key quotas
 
-Every limit is optional and per key. A key can carry any combination, or
-none:
+Every limit is optional and per key:
 
-```rust
+```rust,ignore
 use ai_pool::{AiClient, KeyLimits, RotationMode};
 
 let client = AiClient::builder()
-    .default_url("https://api.openai.com/v1/")
     .rotation_mode(RotationMode::Reactive)
-    // This key allows 5 requests per minute, 100 per hour.
-    .api_key_with_limits(
-        "sk-limited-key",
-        KeyLimits::none().per_minute(5).per_hour(100),
-    )
-    // This key inherits the pool default (unlimited here).
-    .api_key("sk-other-key")
+    .api_key_with_limits("sk-limited", KeyLimits::none().per_minute(5).per_hour(100))
+    .api_key("sk-other")
     .build()
     .await?;
-```
 
-Windows start counting at a key's first use. When a key reaches its limit it
-sits out until the window ends, then recovers on its own; other keys absorb
-the traffic in the meantime. Hour windows are persisted (with the `sqlite`
-store), so usage carries across restarts while the window is still current
-and resets once it has passed.
-
-Live usage is available per key:
-
-```rust
 let quota = client.manager().key_quota(&key_id)?;
-if let Some(minute) = quota.minute {
-    println!(
-        "{} of {:?} used, resets in {}ms",
-        minute.used, minute.limit, minute.resets_in_ms
-    );
-}
 ```
 
-The same snapshot is embedded in `list_keys()`, which is enough to drive a
-usage dashboard with realtime countdowns.
-
-Concurrency caps (`max_concurrency`) only apply in reactive mode, since
-proactive rotation already spreads load; combining them with proactive mode
-is rejected at build time.
+Windows start at a key's first use; a key that reaches its limit sits out
+until the window ends. Hour windows persist with the `sqlite` store.
+Concurrency caps need reactive mode; combining them with proactive mode is
+rejected at build time.
 
 ## Key management
 
-`client.manager()` exposes the administrative surface:
-
-```rust
+```rust,ignore
 let manager = client.manager();
-
-// Censored listing: ids, "sk-proj...8f92" display text, health, quota.
-let keys = manager.list_keys().await?;
-
-// Add, remove, ban, recover.
-let id = manager.add_key("sk-new-key").await?;
+let keys = manager.list_keys().await?;     // censored: "sk-proj...8f92"
+let id = manager.add_key("sk-new-key\n").await?; // trimmed; blank keys refused
 manager.ban_key(&id).await?;
 manager.recover_key(&id).await?;
-manager.remove_key(&id).await?;
-
-// Change limits at runtime.
 manager.set_key_limits(&id, Some(KeyLimits::none().per_minute(10))).await?;
-
-// Explicit decryption, only when plaintext is genuinely needed.
-use ai_pool::ExposeSecret;
-let secret = manager.get_decrypted_key(&id).await?;
-let plaintext = secret.expose_secret();
+let secret = manager.get_decrypted_key(&id).await?; // explicit, on demand
+manager.remove_key(&id).await?;
 ```
 
-Nothing returned by `list_keys` contains plaintext, so it can be handed to
-UI code or logged without leaking secrets.
+Nothing `list_keys` returns contains plaintext.
 
 ## Encrypted persistence
 
-With the `sqlite` feature, keys are stored encrypted at rest:
+```rust,ignore
+use ai_pool::{AiClient, MasterKeyProvider};
 
-```rust
-use ai_pool::MasterKeyProvider;
-
-let client = AiClient::builder()
-    .default_url("https://api.openai.com/v1/")
-    .sqlite_store("data/keys.db")
-    .master_key_provider(MasterKeyProvider::OsKeychain) // feature: os-keychain
-    .api_keys(vec!["sk-my-key"])
+let gemini = AiClient::builder()
+    .default_url("https://generativelanguage.googleapis.com/v1beta/openai/")
+    .sqlite_store(data_dir.join("keys.db"))
+    .key_scope("gemini")
+    .master_key_provider(MasterKeyProvider::os_keychain("com.example.myapp"))
     .build()
     .await?;
 ```
 
-Each key is sealed with AES-256-GCM under a random nonce before it is
-written. Because the encryption is authenticated, a modified database row
-fails decryption cleanly: that key is marked banned as corrupted and the
-rest of the pool loads normally. Seeded keys get deterministic ids derived
-from their contents, so re-running the builder after a restart never creates
-duplicate rows.
+- **Scopes** let one file hold every provider's keys without mixing them.
+- **Master keys**: `os_keychain(service)` under your app's own service name,
+  `File(path)` (created owner-only), `custom_from_slice(&bytes)`, or
+  `Ephemeral` (the default, for the in-memory store). Resolving may block
+  or prompt, so `build` does it off the async workers.
+- **Tampering**: a modified row fails authentication; that key is banned
+  as corrupted and the rest load normally.
+- **Lost master key**: if the key is gone (keychain reset, file deleted),
+  a new one is created and old rows are banned with `LOST_MASTER_KEY`.
+  Adding the same key again replaces the row, so users just re-enter it.
+- **Upgrades**: rows from 0.2's unscoped table move to the empty scope.
 
-The master key can also be supplied directly
-(`MasterKeyProvider::custom_from_slice(&bytes)`) or generated fresh per run
-(`MasterKeyProvider::Ephemeral`, the default, suited to the in-memory
-store).
+Seeded keys get ids derived from their contents, so re-running the builder
+never duplicates rows.
 
-## Typed requests and structured output
+## Structured output
 
-`chat_builder()` assembles requests without hand-written JSON:
+Any JSON Schema works, so a schema written once can serve this crate and
+any other backend:
 
-```rust
-use ai_pool::{JsonSchema, ReasoningEffort, ThinkingConfig};
-use serde::Deserialize;
+```rust,ignore
+#[derive(serde::Deserialize)]
+struct Sentiment { label: String, confidence: f64 }
 
-// Doc comments become schema descriptions the model sees per field.
-#[derive(Debug, Deserialize, JsonSchema)]
-struct Sentiment {
-    /// Exactly "positive", "negative", or "neutral".
-    label: String,
-    /// Confidence between 0.0 and 1.0.
-    confidence: f64,
-}
+let schema = serde_json::json!({
+    "type": "object",
+    "properties": {
+        "label": { "type": "string", "enum": ["positive", "negative", "neutral"] },
+        "confidence": { "type": "number", "description": "Between 0 and 1." }
+    },
+    "required": ["label", "confidence"]
+});
 
 let result: Sentiment = client
     .chat_builder()
     .model("gpt-4o-mini")
-    .system("You are a sentiment classifier.")
     .user("The product arrived two days early and works great.")
-    .temperature(0.2)
-    .thinking(ThinkingConfig::Effort(ReasoningEffort::High))
-    .response_format_schema::<Sentiment>("sentiment")
+    .response_json_schema("sentiment", schema)
     .send()
     .await?;
 ```
 
-Calling `response_format_schema::<T>()` generates a strict JSON schema from
-`T`, attaches it to the request, and types the builder so that `send()`
-returns `T` directly. Replies wrapped in markdown code fences are handled.
-Without a schema, `send()` returns the raw response and `send_text()`
-returns the first choice's text.
+- Strict mode needs every object closed and every property required, so
+  the schema is rewritten on the way out: `additionalProperties: false`
+  everywhere, optional properties become required and nullable. Model
+  optional fields as `Option<T>`. `ResponseFormat::JsonSchema { strict:
+  false, .. }` sends the schema untouched.
+- Property order is preserved; models fill fields in that order.
+- `.response_json::<T>()` asks for any JSON object, for servers without
+  schema support; describe the shape in the prompt.
+- Answers wrapped in code fences or prose still parse.
+- A refusal surfaces as `AiError::Refused(reason)`; an answer cut off at
+  the token limit as `AiError::Truncated`.
+- With `derive`, `.response_format_schema::<T>("name")` builds the schema
+  from `#[derive(JsonSchema)]`, field doc comments becoming descriptions.
 
-Reasoning controls map to the JSON different providers expect:
+Reasoning controls map to the JSON providers expect:
 
 | Configuration | Payload |
 |---|---|
 | `ThinkingConfig::Effort(ReasoningEffort::High)` | `"reasoning_effort": "high"` |
+| `ThinkingConfig::Effort(ReasoningEffort::None)` | `"reasoning_effort": "none"` (Gemini 2.5 Flash, GPT-5.1) |
 | `ThinkingConfig::Enabled { budget_tokens: Some(1024) }` | `"thinking": {"thinking_budget": 1024}` |
 | `ThinkingConfig::Disabled` | `"reasoning_effort": null` |
 
-Provider-specific fields can be added with `.extra(key, value)`.
+`.max_completion_tokens(n)` sends the field OpenAI reasoning models require
+instead of `max_tokens`. Anything else goes through `.extra(key, value)`.
 
-Responses are tolerated in both wire forms some OpenAI-compatible providers
-emit: `message.content` may be a plain string, as OpenAI sends it, or an array
-of content parts (`[{"type":"text","text":"..."}]`), as Gemini and several
-aggregators send it — the latter is normalized to the joined text, with
-non-text parts (images/audio) skipped. `send_text()` and structured `send()`
-work unchanged either way.
+Content arriving as an array of parts is joined into text, non-text parts
+skipped.
 
 ## Streaming
 
-With the `stream` feature:
-
-```rust
+```rust,ignore
 use futures_util::StreamExt;
 
-let mut stream = client
-    .chat_builder()
-    .model("gpt-4o-mini")
-    .user("Write a short poem about the sea.")
-    .send_stream()
-    .await?;
-
+let mut stream = client.chat_builder().model("gpt-4o-mini").user("A poem").send_stream().await?;
 while let Some(chunk) = stream.next().await {
-    let chunk = chunk?;
-    if let Some(text) = chunk.choices[0].delta.content.as_deref() {
+    if let Some(text) = chunk?.choices.first().and_then(|c| c.delta.content.as_deref()) {
         print!("{text}");
     }
 }
 ```
 
-Some providers return 200, start streaming, and then inject an error object
-mid-stream. The parser detects this, updates the key's health (cooldown for
-rate limits, ban for auth errors), and ends the stream with
-`AiError::StreamInterrupted`.
+An error event inside a live stream updates the key's health and ends the
+stream with `AiError::StreamInterrupted`.
 
 ## Custom storage
 
-Storage is behind the `KeyStore` trait. Implement it to back the pool with
-anything else and pass it via `.custom_store(...)`; the built-in options are
-the in-memory store (default) and the SQLite store.
+Implement `KeyStore` and pass it with `.custom_store(...)`.
 
 ## Minimum supported Rust version
 
-Rust 1.85 (edition 2024).
+Rust 1.88 (edition 2024).
+
+## Contributing
+
+Read [AGENTS.md](AGENTS.md) first: comment and commit rules, the never-crash
+rules, and the gates CI runs.
 
 ## License
 

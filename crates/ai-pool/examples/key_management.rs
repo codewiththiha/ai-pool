@@ -1,16 +1,11 @@
-//! Walks through the key management surface: seeding keys, listing them in
-//! censored form, and decrypting one on demand.
-//!
-//! Run with `cargo run --example key_management`.
+//! Seeds keys, lists them censored, and decrypts one on demand.
 
 use ai_pool::{AiClient, ExposeSecret, RotationMode};
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // In-memory store with an ephemeral master key: nothing touches disk.
-    // Swap in `.sqlite_store(path)` + a persistent master key provider for
-    // real deployments.
+    // RAM store and ephemeral master key: nothing touches disk.
     let client = AiClient::builder()
         .default_url("https://generativelanguage.googleapis.com/v1beta/openai/")
         .rotation_mode(RotationMode::Proactive)
@@ -20,8 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()
         .await?;
 
-    // list_keys never returns plaintext, so its output is safe to pass to
-    // whatever layer renders it.
+    // `list_keys` never returns plaintext; safe to render anywhere.
     for meta in client.manager().list_keys().await? {
         println!("{}", serde_json::to_string_pretty(&meta)?);
     }
