@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Lint, all features
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+      - name: Lint, no features
+        run: cargo clippy --workspace --no-default-features --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-features --locked
+
+  checks:
+    name: Format, comments, commits, MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --all --check
+      - name: MSRV check
+        run: cargo check --workspace --all-features --all-targets --locked
+      - name: Comments
+        run: python3 tools/comment_check.py
+      - name: Commit subjects
+        run: python3 tools/commit_check.py --range HEAD
